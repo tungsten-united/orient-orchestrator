@@ -24,8 +24,8 @@ cargo test
 See the server's workflow live, without a phone or real models:
 
 ```sh
-cargo run --example fakes    # fake navigation engine on :8001, fake speech-to-text on :8002
-STT_URL=http://localhost:8002/stt DEBUG_PAGE=1 TRACE_PATH=trace.jsonl cargo run
+cargo run --example fakes    # fake navigation engine and speech-to-text, both on :8001
+STT_URL=http://localhost:8001/stt DEBUG_PAGE=1 TRACE_PATH=trace.jsonl cargo run
 open http://localhost:8000/debug
 ```
 

@@ -1,10 +1,11 @@
-//! Fake upstreams for local runs: the navigation engine on :8001 and speech-to-text on :8002.
+//! Fake upstreams for local runs and staging: the navigation engine and speech-to-text on one
+//! port (`BIND`, default 127.0.0.1:8001), because Cloud Run gives each service a single port.
 //!
 //! The STT treats the audio bytes as the transcript, so the debug page can "speak" by sending text.
 //! The navigation answer is a preset chosen through `POST /control`, which the debug page drives.
 //!
 //!   cargo run --example fakes
-//!   STT_URL=http://localhost:8002/stt DEBUG_PAGE=1 TRACE_PATH=trace.jsonl cargo run
+//!   STT_URL=http://localhost:8001/stt DEBUG_PAGE=1 TRACE_PATH=trace.jsonl cargo run
 //!   open http://localhost:8000/debug
 
 use std::sync::{Arc, Mutex};
@@ -91,21 +92,15 @@ async fn main() -> std::io::Result<()> {
         preset: "continue".into(),
         delay_ms: 300,
     }));
-    let nav = Router::new()
+    let fakes = Router::new()
         .route("/v1/navigate", post(navigate))
         .route("/control", get(get_control).post(set_control))
+        .route("/stt", post(stt))
         .layer(CorsLayer::permissive())
         .with_state(ctl);
-    let stt = Router::new().route("/stt", post(stt));
-    let nav_listener = tokio::net::TcpListener::bind("127.0.0.1:8001").await?;
-    let stt_listener = tokio::net::TcpListener::bind("127.0.0.1:8002").await?;
-    println!(
-        "fake navigation engine on http://localhost:8001 (POST /control to change the answer)"
-    );
-    println!("fake speech-to-text on http://localhost:8002/stt (audio bytes = transcript)");
-    tokio::try_join!(
-        axum::serve(nav_listener, nav),
-        axum::serve(stt_listener, stt)
-    )?;
-    Ok(())
+    let addr = std::env::var("BIND").unwrap_or_else(|_| "127.0.0.1:8001".into());
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    println!("fake navigation engine on http://{addr} (POST /control to change the answer)");
+    println!("fake speech-to-text on http://{addr}/stt (audio bytes = transcript)");
+    axum::serve(listener, fakes).await
 }
