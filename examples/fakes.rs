@@ -1,11 +1,11 @@
-//! Fake upstreams for local runs and staging: the navigation engine and speech-to-text on one
-//! port (`BIND`, default 127.0.0.1:8001), because Cloud Run gives each service a single port.
+//! Fake upstreams for local runs and staging: the navigation engine and ElevenLabs speech-to-text
+//! on one port (`BIND`, default 127.0.0.1:8001), because Cloud Run gives each service a single port.
 //!
-//! The STT treats the audio bytes as the transcript, so the debug page can "speak" by sending text.
+//! The fake Scribe treats the audio bytes as the transcript, so the debug page can "speak" by sending text.
 //! The navigation answer is a preset chosen through `POST /control`, which the debug page drives.
 //!
 //!   cargo run --example fakes
-//!   STT_URL=http://localhost:8001/stt DEBUG_PAGE=1 TRACE_PATH=trace.jsonl cargo run
+//!   ELEVENLABS_URL=http://localhost:8001 DEBUG_PAGE=1 TRACE_PATH=trace.jsonl cargo run
 //!   open http://localhost:8000/debug
 
 use std::sync::{Arc, Mutex};
@@ -29,14 +29,15 @@ struct Control {
 
 type Shared = Arc<Mutex<Control>>;
 
+/// ElevenLabs Scribe's answer shape; only `text` is used.
 async fn stt(mut mp: Multipart) -> Json<Value> {
-    let mut transcript = String::new();
+    let mut text = String::new();
     while let Ok(Some(field)) = mp.next_field().await {
-        if field.name() == Some("audio") {
-            transcript = String::from_utf8_lossy(&field.bytes().await.unwrap_or_default()).into();
+        if field.name() == Some("file") {
+            text = String::from_utf8_lossy(&field.bytes().await.unwrap_or_default()).into();
         }
     }
-    Json(json!({"transcript": transcript}))
+    Json(json!({"language_code": "en", "language_probability": 1.0, "text": text, "words": []}))
 }
 
 async fn navigate(State(ctl): State<Shared>, mut mp: Multipart) -> Result<Json<Value>, StatusCode> {
@@ -95,12 +96,12 @@ async fn main() -> std::io::Result<()> {
     let fakes = Router::new()
         .route("/v1/navigate", post(navigate))
         .route("/control", get(get_control).post(set_control))
-        .route("/stt", post(stt))
+        .route("/v1/speech-to-text", post(stt))
         .layer(CorsLayer::permissive())
         .with_state(ctl);
     let addr = std::env::var("BIND").unwrap_or_else(|_| "127.0.0.1:8001".into());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!("fake navigation engine on http://{addr} (POST /control to change the answer)");
-    println!("fake speech-to-text on http://{addr}/stt (audio bytes = transcript)");
+    println!("fake ElevenLabs speech-to-text on http://{addr} (audio bytes = transcript)");
     axum::serve(listener, fakes).await
 }

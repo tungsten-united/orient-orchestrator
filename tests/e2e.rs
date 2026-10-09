@@ -1,13 +1,15 @@
 //! End to end over HTTP and SSE, against the native server (default) or a running deployment.
 //!
 //!   cargo test --test e2e                                  # in-process server, fakes on random ports
-//!   E2E_BASE=http://localhost:8787 cargo test --test e2e   # fakes on :8101 (nav) and :8102 (stt)
+//!   E2E_BASE=https://… cargo test --test e2e   # fakes on :8101 (nav) and :8102 (ElevenLabs);
+//!                                             # point NAV_URL and ELEVENLABS_URL there
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::Multipart;
+use axum::http::HeaderMap;
 use axum::routing::post;
 use axum::{Json, Router};
 use futures::{Stream, StreamExt};
@@ -25,10 +27,17 @@ struct FakeNav {
     frames_seen: usize,
 }
 
+/// What the fake ElevenLabs received.
+#[derive(Default)]
+struct FakeEleven {
+    stt_request: Value,
+}
+
 struct Harness {
     base: String,
     http: reqwest::Client,
     nav: Arc<Mutex<FakeNav>>,
+    eleven: Arc<Mutex<FakeEleven>>,
 }
 
 async fn serve(router: Router, port: u16) -> String {
@@ -62,33 +71,45 @@ async fn harness() -> Harness {
             }
         }),
     );
-    // Fake STT: the "audio" bytes are the transcript.
-    let fake_stt = Router::new().route(
-        "/stt",
-        post(|mut mp: Multipart| async move {
-            let audio = mp
-                .next_field()
-                .await
-                .unwrap()
-                .unwrap()
-                .bytes()
-                .await
-                .unwrap();
-            Json(json!({"transcript": String::from_utf8_lossy(&audio)}))
+    // Fake ElevenLabs Scribe: the "audio" bytes are the transcript.
+    let eleven = Arc::new(Mutex::new(FakeEleven::default()));
+    let fake = eleven.clone();
+    let fake_eleven = Router::new().route(
+        "/v1/speech-to-text",
+        post(move |headers: HeaderMap, mut mp: Multipart| {
+            let fake = fake.clone();
+            async move {
+                let mut request = json!({"key": headers.get("xi-api-key").and_then(|v| v.to_str().ok())});
+                let mut text = String::new();
+                while let Some(f) = mp.next_field().await.unwrap() {
+                    let name = f.name().unwrap_or("").to_string();
+                    if name == "file" {
+                        request["fileType"] = json!(f.content_type());
+                        text = String::from_utf8_lossy(&f.bytes().await.unwrap()).into();
+                    } else {
+                        request[name] = json!(f.text().await.unwrap());
+                    }
+                }
+                fake.lock().unwrap().stt_request = request;
+                Json(json!({"language_code": "en", "language_probability": 0.98, "text": text, "words": []}))
+            }
         }),
     );
     let base = match std::env::var("E2E_BASE") {
         Ok(base) => {
             serve(fake_vla, 8101).await;
-            serve(fake_stt, 8102).await;
+            serve(fake_eleven, 8102).await;
             base
         }
         Err(_) => {
-            let mut pipeline = Pipeline::from_vars(&|_| None);
-            pipeline.nav_url = serve(fake_vla, 0).await;
-            pipeline.stt_url = format!("{}/stt", serve(fake_stt, 0).await);
+            let vars = [
+                ("NAV_URL", serve(fake_vla, 0).await),
+                ("ELEVENLABS_URL", serve(fake_eleven, 0).await),
+                ("ELEVENLABS_API_KEY", "test-key".into()),
+            ];
+            let get = |k: &str| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone());
             let route: Route = serde_json::from_str(include_str!("../src/route.json")).unwrap();
-            let app = Arc::new(AppState::new(route, pipeline, &|_| None));
+            let app = Arc::new(AppState::new(route, Pipeline::from_vars(&get), &get));
             serve(server::router(app), 0).await
         }
     };
@@ -96,6 +117,7 @@ async fn harness() -> Harness {
         base,
         http: reqwest::Client::new(),
         nav,
+        eleven,
     }
 }
 
@@ -271,6 +293,16 @@ async fn sessions_frames_worker_and_stop() {
         (Some("guidance"), Some("Keep going straight."))
     );
     assert_eq!(frames_seen(), 1);
+    // Scribe got the phone's audio as is, with the contract's settings (contracts.md section 4).
+    let mut stt = h.eleven.lock().unwrap().stt_request.clone();
+    if std::env::var("E2E_BASE").is_err() {
+        assert_eq!(stt["key"], "test-key");
+    }
+    stt.as_object_mut().unwrap().remove("key");
+    assert_eq!(
+        stt,
+        json!({"model_id": "scribe_v2", "language_code": "en", "tag_audio_events": "false", "fileType": "audio/webm"})
+    );
 
     // Replays, old sequences and old captures are rejected without side effects.
     assert_eq!(say("u1", 2, 0, "bathroom").await.unwrap().status(), 202);

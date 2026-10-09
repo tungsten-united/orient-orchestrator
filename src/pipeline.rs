@@ -1,4 +1,4 @@
-//! Model calls behind the orchestrator: STT, command (TypeSafe Jev), navigation, the worker's
+//! Model calls behind the orchestrator: speech (ElevenLabs), command (TypeSafe Jev), navigation, the worker's
 //! comparison rule, and the sentence templates.
 //!
 //! Every model output is validated here. Nothing in this module changes session state.
@@ -74,7 +74,7 @@ pub struct Pipeline {
     http: reqwest::Client,
     pub nav_url: String,
     pub engine: String,
-    pub stt_url: String,
+    eleven: ElevenLabs,
     jev_url: String,
     pub jev_api_key: String,
     jev_model: String,
@@ -83,7 +83,17 @@ pub struct Pipeline {
     pub repeat_ms: i64,
 }
 
-/// Settings lookup: process environment natively, Worker vars and secrets on Cloudflare.
+const ELEVENLABS_URL: &str = "https://api.elevenlabs.io";
+
+/// ElevenLabs settings for both directions (contracts.md section 4).
+struct ElevenLabs {
+    url: String, // ELEVENLABS_URL: the real API, or the fakes
+    key: String,
+    stt_model: String,
+    language: String,
+}
+
+/// Settings lookup: the process environment.
 pub type Vars<'a> = &'a dyn Fn(&str) -> Option<String>;
 
 pub fn var(get: Vars, name: &str, default: &str) -> String {
@@ -180,7 +190,12 @@ impl Pipeline {
             http: reqwest::Client::new(),
             nav_url: env("NAV_URL", "http://localhost:8001"),
             engine: env("NAV_ENGINE", "vla"),
-            stt_url: env("STT_URL", ""),
+            eleven: ElevenLabs {
+                url: env("ELEVENLABS_URL", ELEVENLABS_URL),
+                key: env("ELEVENLABS_API_KEY", ""),
+                stt_model: env("ELEVENLABS_STT_MODEL", "scribe_v2"),
+                language: env("SPEECH_LANGUAGE", "en"),
+            },
             jev_url: env("JEV_URL", "https://api.typesafe.ai/v1/systemone"),
             jev_api_key: env("TYPESAFE_API_KEY", ""),
             jev_model: env("JEV_MODEL", "jev-latest"),
@@ -216,22 +231,34 @@ impl Pipeline {
         Ok(r["answers"].clone())
     }
 
+    /// Speech needs a key, unless ELEVENLABS_URL points at fakes.
+    pub fn speech_configured(&self) -> bool {
+        !self.eleven.key.is_empty() || self.eleven.url != ELEVENLABS_URL
+    }
+
+    /// ElevenLabs Scribe, batch: the phone's audio as received, no transcoding.
     pub async fn transcribe(&self, audio: Vec<u8>, content_type: &str) -> Result<String, BoxError> {
-        // ponytail: open point 1. Any HTTP STT that returns {"transcript": ...}; Jev only takes text and JSON state.
-        let part = Part::bytes(audio)
+        let e = &self.eleven;
+        let file = Part::bytes(audio)
             .file_name("audio")
             .mime_str(content_type)?;
+        let form = Form::new()
+            .text("model_id", e.stt_model.clone())
+            .text("language_code", e.language.clone())
+            .text("tag_audio_events", "false")
+            .part("file", file);
         let r: Value = self
             .http
-            .post(&self.stt_url)
-            .multipart(Form::new().part("audio", part))
+            .post(format!("{}/v1/speech-to-text", e.url))
+            .header("xi-api-key", &e.key)
+            .multipart(form)
             .timeout(Duration::from_secs(5))
             .send()
             .await?
             .error_for_status()?
             .json()
             .await?;
-        Ok(r["transcript"].as_str().ok_or("no transcript")?.to_string())
+        Ok(r["text"].as_str().ok_or("no text")?.to_string())
     }
 
     pub async fn command(

@@ -24,8 +24,8 @@ cargo test
 See the server's workflow live, without a phone or real models:
 
 ```sh
-cargo run --example fakes    # fake navigation engine and speech-to-text, both on :8001
-STT_URL=http://localhost:8001/stt DEBUG_PAGE=1 TRACE_PATH=trace.jsonl cargo run
+cargo run --example fakes    # fake navigation engine and ElevenLabs speech-to-text, both on :8001
+ELEVENLABS_URL=http://localhost:8001 DEBUG_PAGE=1 TRACE_PATH=trace.jsonl cargo run
 open http://localhost:8000/debug
 ```
 
@@ -36,7 +36,7 @@ The page drives the real API. You can start a client, "say" a destination (the f
 Staging is released by hand: **Actions > Deploy staging > Run workflow**, then pick a branch or tag. The workflow runs the CI checks, builds one image (`Dockerfile`: the server, plus the fakes), pushes it to Artifact Registry, and deploys two Cloud Run services:
 
 - `orient-fakes-staging`: the fake navigation engine and STT. Only when the **fakes** box is ticked (the default).
-- `orient-orchestrator-staging`: the server with `DEBUG_PAGE=1`, pointed at the fakes, or at the `NAV_URL` and `STT_URL` of the `staging` environment when the box is unticked. Share `<url>/debug` with the team. `/v1/health` shows the deployed commit.
+- `orient-orchestrator-staging`: the server with `DEBUG_PAGE=1`, pointed at the fakes, or at the `staging` environment's `NAV_URL` and the real ElevenLabs API when the box is unticked. Share `<url>/debug` with the team. `/v1/health` shows the deployed commit.
 
 Both services are public. Anyone with the URL can use the debug page and change the fake answers. Each release drops the clients in memory: connected phones get 404 and start a new client.
 
@@ -74,7 +74,8 @@ Then, in GitHub, create the environment `staging` (Settings > Environments) with
 | `GCP_WIF_PROVIDER` | printed by the last command |
 | `GCP_DEPLOY_SA` | `github-deploy@<project>.iam.gserviceaccount.com` |
 | `GCP_RUNTIME_SA` | service account the services run as. The deploy account needs `roles/iam.serviceAccountUser` on it |
-| `NAV_URL`, `STT_URL` | optional: the real models, for releases without fakes |
+| `NAV_URL` | optional: the real navigation model, for releases without fakes |
+| `ELEVENLABS_SECRET` | optional: name of a Secret Manager secret holding the ElevenLabs key, for releases without fakes |
 | `ALLOW_ORIGINS` | optional: the web app's staging origin (default `*`) |
 | `TYPESAFE_SECRET` | optional: name of a Secret Manager secret holding the TypeSafe key. Grant the Cloud Run runtime service account `roles/secretmanager.secretAccessor` on it |
 
@@ -106,7 +107,10 @@ To require approval before each release, add required reviewers to the `staging`
 | `JEV_URL` | `https://api.typesafe.ai/v1/systemone` | System One endpoint |
 | `JEV_MODEL` | `jev-latest` | Jev model |
 | `JEV_MIN_CONFIDENCE` | `0.5` | Below this, the command is treated as unclear and the user is asked again |
-| `STT_URL` | empty | Speech-to-text service, `POST` with an `audio` part, returns `{"transcript"}`. Required: utterances return 503 without it |
+| `ELEVENLABS_API_KEY` | empty | ElevenLabs key (`xi-api-key`). Server only. Required unless `ELEVENLABS_URL` points at fakes: utterances return 503 without it |
+| `ELEVENLABS_URL` | `https://api.elevenlabs.io` | ElevenLabs base URL. Point it at `examples/fakes.rs` for local runs and staging |
+| `ELEVENLABS_STT_MODEL` | `scribe_v2` | Speech-to-text model |
+| `SPEECH_LANGUAGE` | `en` | Sent to ElevenLabs, so Scribe skips language detection |
 | `NAV_FRAMES` | `5` | Frames per navigation call |
 | `ROUTE_PATH` | built-in `src/route.json` | Route definition |
 | `MAX_INPUT_AGE_MS` | `3000` | Reject older input |
@@ -140,7 +144,6 @@ To require approval before each release, add required reviewers to the `staging`
 
 - The Jev call has not been run against the live API yet. The request and answer shapes come from the TypeSafe quickstart, and the parsing is unit-tested against them.
 - 429 and 529 from TypeSafe are not retried. With a 3 s budget, the user is asked again instead.
-- STT is any HTTP service returning `{"transcript": ...}` (open point 1).
 - The first navigation calls of a session carry fewer than 5 frames.
 - Sessions live in memory in one process and never expire.
 - The server checks audio and frame sizes in bytes only. The phone enforces `maxAudioMs` and `maxFrameEdgePx`.

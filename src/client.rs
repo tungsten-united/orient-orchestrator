@@ -551,7 +551,7 @@ pub fn utterance(app: &App, cref: &ClientRef, parts: Parts) -> ApiResult<Value> 
         return Ok(r.clone());
     }
     let audio = parts.audio.ok_or_else(|| bad_request("audio: missing"))?;
-    if app.pipeline.stt_url.is_empty() {
+    if !app.pipeline.speech_configured() {
         let mut e = api_error(
             503,
             "upstream_unavailable",
