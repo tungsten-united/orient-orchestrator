@@ -1,10 +1,14 @@
 //! Orient orchestrator: the only service the phone talks to.
 //!
 //! Implements docs/contracts.md from tungsten-united/project-description.
+//!
+//! A client is one phone from Start to Stop: it holds the token and the event stream.
+//! A session is one spoken action (go to a destination). When speech-to-text yields a
+//! different action, a new session starts with an empty frame buffer and no previous output.
 
 mod pipeline;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::io::Write;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -23,7 +27,7 @@ use tokio::sync::broadcast;
 use tokio::task::AbortHandle;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
-use pipeline::{Command, Destination, Pipeline, Route, Spoken, env};
+use pipeline::{Command, Destination, Output, Pipeline, Route, env};
 
 const AUDIO_TYPES: [&str; 2] = ["audio/webm", "audio/mp4"];
 const NAV_FAILURES_BEFORE_ERROR: u32 = 3;
@@ -54,6 +58,7 @@ struct Limits {
     max_frame_edge_px: i64, // enforced by the phone
     max_input_age_ms: i64,
     heartbeat_ms: u64,
+    nav_frames: usize,
 }
 
 struct AppState {
@@ -61,12 +66,12 @@ struct AppState {
     pipeline: Pipeline,
     limits: Limits,
     trace_path: Option<String>,
-    // ponytail: in-memory sessions in one process, never expired. Fine for one demo phone; add a store if we scale out.
-    sessions: Mutex<HashMap<String, SessionRef>>,
+    // ponytail: in-memory clients in one process, never expired. Fine for one demo phone; add a store if we scale out.
+    clients: Mutex<HashMap<String, ClientRef>>,
 }
 
 type App = Arc<AppState>;
-type SessionRef = Arc<Mutex<Session>>;
+type ClientRef = Arc<Mutex<Client>>;
 
 impl AppState {
     fn new(route: Route, pipeline: Pipeline) -> Self {
@@ -82,9 +87,10 @@ impl AppState {
                     .parse()
                     .expect("MAX_INPUT_AGE_MS"),
                 heartbeat_ms: 5000,
+                nav_frames: env("NAV_FRAMES", "5").parse().expect("NAV_FRAMES"),
             },
             trace_path: std::env::var("TRACE_PATH").ok(),
-            sessions: Mutex::default(),
+            clients: Mutex::default(),
         }
     }
 
@@ -135,41 +141,71 @@ struct RetryBody {
     from: RetryFrom,
 }
 
-struct Pending {
-    meta: Meta,
-    frame: Vec<u8>,
-    received: i64,
+/// One spoken action: guidance to one destination.
+struct Session {
+    id: String,
+    destination: Destination,
+    step: String,
+    frames: VecDeque<(Meta, Vec<u8>)>, // last `nav_frames` accepted frames, oldest first
+    pending: Option<Meta>,             // newest frame not evaluated yet
+    previous: Option<Output>,          // the worker compares each output with this one
+    last_spoken_at: i64,
+    arrived: bool,
+    nav_failures: u32,
 }
 
-struct Session {
+impl Session {
+    fn new(destination: Destination, step: String) -> Self {
+        Session {
+            id: uuid::Uuid::new_v4().to_string(),
+            destination,
+            step,
+            frames: VecDeque::new(),
+            pending: None,
+            previous: None,
+            last_spoken_at: 0,
+            arrived: false,
+            nav_failures: 0,
+        }
+    }
+}
+
+/// One phone from Start to Stop.
+struct Client {
     id: String,
     token: String,
     generation: i64,
-    phase: &'static str,
-    step: String,
-    destination: Option<Destination>,
+    stopped: bool,
     sequence: i64,
     responses: HashMap<String, Value>, // requestId -> response body, for idempotent replays
     events: broadcast::Sender<Value>,
     tasks: Vec<AbortHandle>,
-    pending: Option<Pending>, // latest frame waiting for the navigation loop
-    nav_task: Option<tokio::task::Id>,
-    nav_failures: u32,
-    last_spoken: Option<Spoken>,
+    worker: Option<tokio::task::Id>,
+    session: Option<Session>,
     entries: Vec<Value>,
     trace_path: Option<String>,
 }
 
-fn lock(s: &SessionRef) -> MutexGuard<'_, Session> {
-    s.lock().unwrap()
+fn lock(c: &ClientRef) -> MutexGuard<'_, Client> {
+    c.lock().unwrap()
 }
 
-impl Session {
+impl Client {
+    fn phase(&self) -> &'static str {
+        match &self.session {
+            _ if self.stopped => "stopped",
+            None => "awaiting_destination",
+            Some(s) if s.arrived => "arrived",
+            Some(_) => "navigating",
+        }
+    }
+
     fn event(&self, kind: &str, request_id: Option<&str>, data: Value) -> Value {
         merge(
             &json!({
-                "type": kind, "eventId": uuid::Uuid::new_v4().to_string(), "sessionId": self.id,
-                "generation": self.generation, "requestId": request_id, "emittedAt": now_ms(),
+                "type": kind, "eventId": uuid::Uuid::new_v4().to_string(), "clientId": self.id,
+                "sessionId": self.session.as_ref().map(|s| &s.id), "generation": self.generation,
+                "requestId": request_id, "emittedAt": now_ms(),
             }),
             data,
         )
@@ -181,20 +217,27 @@ impl Session {
 
     fn state(&self) -> Value {
         json!({
-            "phase": self.phase, "routeStepId": self.step,
-            "destinationId": self.destination.as_ref().map(|d| &d.destination_id),
+            "phase": self.phase(),
+            "sessionId": self.session.as_ref().map(|s| &s.id),
+            "destinationId": self.session.as_ref().map(|s| &s.destination.destination_id),
+            "routeStepId": self.session.as_ref().map(|s| &s.step),
         })
     }
 
     fn heartbeat(&self, last_request_id: Option<&str>, quiet_reason: Option<&str>) -> Value {
-        json!({"phase": self.phase, "routeStepId": self.step, "lastRequestId": last_request_id, "quietReason": quiet_reason})
+        merge(
+            &self.state(),
+            json!({"lastRequestId": last_request_id, "quietReason": quiet_reason}),
+        )
     }
 
     /// Invalidate everything in flight: late results see a newer generation and are dropped.
     fn reset(&mut self) {
         self.generation += 1;
-        self.pending = None;
-        self.nav_task = None;
+        self.worker = None;
+        if let Some(s) = &mut self.session {
+            s.pending = None;
+        }
         let me = tokio::task::try_id();
         for task in self.tasks.drain(..) {
             if Some(task.id()) != me {
@@ -206,17 +249,32 @@ impl Session {
     fn halt(&mut self, kind: &str, request_id: Option<&str>, data: Value) {
         self.emit(kind, request_id, data);
         self.reset();
-        self.phase = "stopped";
+        self.stopped = true;
+    }
+
+    /// A different action: new session, empty frame buffer, no previous output.
+    fn start_session(&mut self, destination: Destination) {
+        self.reset();
+        self.stopped = false;
+        // Physical position carries over when the new route passes through it.
+        let step = match &self.session {
+            Some(s) if destination.steps.contains(&s.step) => s.step.clone(),
+            _ => destination.steps[0].clone(),
+        };
+        self.session = Some(Session::new(destination, step));
     }
 
     fn log(&mut self, request_id: Option<&str>, kind: &str, fields: Value) {
         let entry = merge(
             &json!({
-                "at": now_ms(), "sessionId": self.id, "generation": self.generation, "requestId": request_id,
-                "kind": kind, "clientRouteStepId": null, "routeStepId": self.step,
-                "destinationId": self.destination.as_ref().map(|d| &d.destination_id),
-                "transcript": null, "command": null, "engine": null, "action": null, "confidence": null,
-                "observation": null, "spoke": false, "text": null, "timingsMs": {}, "dropped": null, "error": null,
+                "at": now_ms(), "clientId": self.id,
+                "sessionId": self.session.as_ref().map(|s| &s.id), "generation": self.generation,
+                "requestId": request_id, "kind": kind, "clientRouteStepId": null,
+                "routeStepId": self.session.as_ref().map(|s| &s.step),
+                "destinationId": self.session.as_ref().map(|s| &s.destination.destination_id),
+                "transcript": null, "command": null, "engine": null, "framesSent": null,
+                "action": null, "confidence": null, "observation": null, "spoke": false,
+                "text": null, "timingsMs": {}, "dropped": null, "error": null,
             }),
             fields,
         );
@@ -245,22 +303,20 @@ impl Session {
     }
 }
 
-/// Latest frame wins: a frame still waiting is replaced, never queued.
-fn submit_frame(app: &App, sref: &SessionRef, s: &mut Session, meta: Meta, frame: Vec<u8>) {
-    if let Some(old) = s.pending.take() {
-        s.log(
-            Some(&old.meta.request_id),
-            "frame",
-            json!({"dropped": "superseded"}),
-        );
+/// Every accepted frame joins the session's buffer. Only the newest one triggers an evaluation;
+/// one still waiting is superseded, but its image stays in the buffer.
+fn submit_frame(app: &App, cref: &ClientRef, c: &mut Client, meta: Meta, frame: Vec<u8>) {
+    let Some(s) = c.session.as_mut() else { return };
+    s.frames.push_back((meta.clone(), frame));
+    while s.frames.len() > app.limits.nav_frames {
+        s.frames.pop_front();
     }
-    s.pending = Some(Pending {
-        meta,
-        frame,
-        received: now_ms(),
-    });
-    if s.nav_task.is_none() {
-        s.nav_task = Some(s.spawn(nav_loop(app.clone(), sref.clone())));
+    let superseded = s.pending.replace(meta).map(|m| m.request_id);
+    if let Some(rid) = superseded {
+        c.log(Some(&rid), "frame", json!({"dropped": "superseded"}));
+    }
+    if c.worker.is_none() {
+        c.worker = Some(c.spawn(worker(app.clone(), cref.clone())));
     }
 }
 
@@ -293,16 +349,11 @@ impl IntoResponse for ApiError {
 
 type ApiResult<T> = Result<T, ApiError>;
 
-fn get_session(app: &App, id: &str, token: &str) -> ApiResult<SessionRef> {
-    let sref = app.sessions.lock().unwrap().get(id).cloned();
-    let sref = sref.ok_or_else(|| {
-        api_error(
-            StatusCode::NOT_FOUND,
-            "session_not_found",
-            "Unknown session.",
-        )
-    })?;
-    let expected = lock(&sref).token.clone();
+fn get_client(app: &App, id: &str, token: &str) -> ApiResult<ClientRef> {
+    let cref = app.clients.lock().unwrap().get(id).cloned();
+    let cref = cref
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "client_not_found", "Unknown client."))?;
+    let expected = lock(&cref).token.clone();
     let same = token.len() == expected.len()
         && token
             .bytes()
@@ -316,7 +367,7 @@ fn get_session(app: &App, id: &str, token: &str) -> ApiResult<SessionRef> {
             "Missing or wrong token.",
         ));
     }
-    Ok(sref)
+    Ok(cref)
 }
 
 fn bearer(headers: &HeaderMap) -> &str {
@@ -331,16 +382,16 @@ fn body<T>(body: Result<Json<T>, JsonRejection>) -> ApiResult<T> {
         .map_err(|e| bad_request(e.body_text()))
 }
 
-fn accept(app: &App, s: &mut Session, m: &Meta, kind: &str) -> ApiResult<()> {
-    if m.generation != s.generation {
+fn accept(app: &App, c: &mut Client, m: &Meta, kind: &str) -> ApiResult<()> {
+    if m.generation != c.generation {
         return Err(api_error(
             StatusCode::CONFLICT,
             "stale_generation",
-            "Session was stopped or restarted.",
+            "Session was stopped or replaced.",
         ));
     }
-    if m.sequence <= s.sequence {
-        s.log(
+    if m.sequence <= c.sequence {
+        c.log(
             Some(&m.request_id),
             kind,
             json!({"dropped": "stale_sequence"}),
@@ -352,7 +403,7 @@ fn accept(app: &App, s: &mut Session, m: &Meta, kind: &str) -> ApiResult<()> {
         ));
     }
     if now_ms() - m.captured_at > app.limits.max_input_age_ms {
-        s.log(
+        c.log(
             Some(&m.request_id),
             kind,
             json!({"dropped": "expired_input"}),
@@ -365,14 +416,13 @@ fn accept(app: &App, s: &mut Session, m: &Meta, kind: &str) -> ApiResult<()> {
         e.retryable = true;
         return Err(e);
     }
-    s.sequence = m.sequence;
+    c.sequence = m.sequence;
     Ok(())
 }
 
 #[derive(Default)]
 struct Parts {
     meta: Option<String>,
-    transcript: Option<String>,
     audio: Option<(Vec<u8>, String)>,
     frame: Option<Vec<u8>>,
 }
@@ -396,10 +446,6 @@ async fn read_parts(app: &App, mut mp: Multipart) -> ApiResult<Parts> {
         let (types, limit): (&[&str], usize) = match name.as_str() {
             "meta" => {
                 p.meta = Some(field.text().await.map_err(mp_error)?);
-                continue;
-            }
-            "transcript" => {
-                p.transcript = Some(field.text().await.map_err(mp_error)?);
                 continue;
             }
             "audio" => (&AUDIO_TYPES, app.limits.max_audio_bytes),
@@ -456,32 +502,28 @@ async fn health() -> Json<Value> {
     Json(json!({"status": "ok", "version": env!("CARGO_PKG_VERSION")}))
 }
 
-async fn create_session(State(app): State<App>) -> (StatusCode, Json<Value>) {
+async fn create_client(State(app): State<App>) -> (StatusCode, Json<Value>) {
     let id = uuid::Uuid::new_v4().to_string();
     let token = format!(
         "{}{}",
         uuid::Uuid::new_v4().simple(),
         uuid::Uuid::new_v4().simple()
     );
-    let mut s = Session {
+    let mut c = Client {
         id: id.clone(),
         token: token.clone(),
         generation: 1,
-        phase: "awaiting_destination",
-        step: app.route.start_step_id.clone(),
-        destination: None,
+        stopped: false,
         sequence: -1,
         responses: HashMap::new(),
         events: broadcast::channel(64).0,
         tasks: Vec::new(),
-        pending: None,
-        nav_task: None,
-        nav_failures: 0,
-        last_spoken: None,
+        worker: None,
+        session: None,
         entries: Vec::new(),
         trace_path: app.trace_path.clone(),
     };
-    s.log(None, "session", json!({}));
+    c.log(None, "client", json!({}));
     let destinations: Vec<Value> = app
         .route
         .destinations
@@ -489,18 +531,18 @@ async fn create_session(State(app): State<App>) -> (StatusCode, Json<Value>) {
         .map(|d| json!({"destinationId": d.destination_id, "label": d.label}))
         .collect();
     let response = json!({
-        "sessionId": id,
-        "sessionToken": token,
-        "generation": s.generation,
+        "clientId": id,
+        "clientToken": token,
+        "generation": c.generation,
         "serverTime": now_ms(),
-        "phase": s.phase,
+        "phase": c.phase(),
         "route": {"routeId": app.route.route_id, "startStepId": app.route.start_step_id, "destinations": destinations},
         "limits": app.limits,
     });
-    app.sessions
+    app.clients
         .lock()
         .unwrap()
-        .insert(id, Arc::new(Mutex::new(s)));
+        .insert(id, Arc::new(Mutex::new(c)));
     (StatusCode::CREATED, Json(response))
 }
 
@@ -509,27 +551,27 @@ async fn events(
     Path(id): Path<String>,
     Query(q): Query<HashMap<String, String>>,
 ) -> ApiResult<impl IntoResponse> {
-    let sref = get_session(&app, &id, q.get("token").map_or("", String::as_str))?;
+    let cref = get_client(&app, &id, q.get("token").map_or("", String::as_str))?;
     let (rx, first) = {
-        let s = lock(&sref);
-        (s.events.subscribe(), s.event("state", None, s.state()))
+        let c = lock(&cref);
+        (c.events.subscribe(), c.event("state", None, c.state()))
     };
     let heartbeat = Duration::from_millis(app.limits.heartbeat_ms);
     let stream = futures::stream::unfold((rx, Some(first)), move |(mut rx, first)| {
-        let sref = sref.clone();
+        let cref = cref.clone();
         async move {
             let ev = match first {
                 Some(ev) => ev,
                 None => match tokio::time::timeout(heartbeat, rx.recv()).await {
                     Ok(Ok(ev)) => ev,
                     Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
-                        let s = lock(&sref);
-                        s.event("state", None, s.state()) // fell behind: resync from a snapshot
+                        let c = lock(&cref);
+                        c.event("state", None, c.state()) // fell behind: resync from a snapshot
                     }
                     Ok(Err(broadcast::error::RecvError::Closed)) => return None,
                     Err(_) => {
-                        let s = lock(&sref);
-                        s.event("heartbeat", None, s.heartbeat(None, None))
+                        let c = lock(&cref);
+                        c.event("heartbeat", None, c.heartbeat(None, None))
                     }
                 },
             };
@@ -548,35 +590,32 @@ async fn utterance(
     headers: HeaderMap,
     mp: Multipart,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    let sref = get_session(&app, &id, bearer(&headers))?;
+    let cref = get_client(&app, &id, bearer(&headers))?;
     let parts = read_parts(&app, mp).await?;
     let m = parse_meta(parts.meta)?;
-    let mut s = lock(&sref);
-    if let Some(r) = s.responses.get(&m.request_id) {
+    let mut c = lock(&cref);
+    if let Some(r) = c.responses.get(&m.request_id) {
         return Ok((StatusCode::ACCEPTED, Json(r.clone())));
     }
-    if parts.audio.is_some() == parts.transcript.is_some() {
-        return Err(bad_request("Send exactly one of audio or transcript."));
-    }
-    if parts.audio.is_some() && app.pipeline.stt_url.is_empty() {
+    let audio = parts.audio.ok_or_else(|| bad_request("audio: missing"))?;
+    if app.pipeline.stt_url.is_empty() {
         let mut e = api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "upstream_unavailable",
-            "Speech to text is not configured; send a transcript.",
+            "Speech to text is not configured.",
         );
         e.retryable = true;
         return Err(e);
     }
-    accept(&app, &mut s, &m, "utterance")?;
-    s.spawn(handle_utterance(
+    accept(&app, &mut c, &m, "utterance")?;
+    c.spawn(handle_utterance(
         app.clone(),
-        sref.clone(),
+        cref.clone(),
         m.clone(),
-        parts.transcript,
-        parts.audio,
+        audio,
         parts.frame,
     ));
-    Ok((StatusCode::ACCEPTED, Json(s.accepted(&m.request_id))))
+    Ok((StatusCode::ACCEPTED, Json(c.accepted(&m.request_id))))
 }
 
 async fn frames(
@@ -585,25 +624,25 @@ async fn frames(
     headers: HeaderMap,
     mp: Multipart,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    let sref = get_session(&app, &id, bearer(&headers))?;
+    let cref = get_client(&app, &id, bearer(&headers))?;
     let parts = read_parts(&app, mp).await?;
     let m = parse_meta(parts.meta)?;
     let frame = parts.frame.ok_or_else(|| bad_request("frame: missing"))?;
-    let mut s = lock(&sref);
-    if let Some(r) = s.responses.get(&m.request_id) {
+    let mut c = lock(&cref);
+    if let Some(r) = c.responses.get(&m.request_id) {
         return Ok((StatusCode::ACCEPTED, Json(r.clone())));
     }
-    if s.phase != "navigating" {
+    if c.phase() != "navigating" {
         return Err(api_error(
             StatusCode::CONFLICT,
             "not_navigating",
-            format!("Session is {}.", s.phase),
+            format!("Client is {}.", c.phase()),
         ));
     }
-    accept(&app, &mut s, &m, "frame")?;
+    accept(&app, &mut c, &m, "frame")?;
     let request_id = m.request_id.clone();
-    submit_frame(&app, &sref, &mut s, m, frame);
-    Ok((StatusCode::ACCEPTED, Json(s.accepted(&request_id))))
+    submit_frame(&app, &cref, &mut c, m, frame);
+    Ok((StatusCode::ACCEPTED, Json(c.accepted(&request_id))))
 }
 
 /// Stop always wins: any generation is accepted.
@@ -613,16 +652,19 @@ async fn stop(
     headers: HeaderMap,
     b: Result<Json<StopBody>, JsonRejection>,
 ) -> ApiResult<Json<Value>> {
-    let sref = get_session(&app, &id, bearer(&headers))?;
+    let cref = get_client(&app, &id, bearer(&headers))?;
     let b = body(b)?;
-    let mut s = lock(&sref);
-    if !s.responses.contains_key(&b.request_id) {
-        s.halt("stop", Some(&b.request_id), json!({"reason": "user_stop"}));
-        s.log(Some(&b.request_id), "stop", json!({}));
-        let r = json!({"sessionId": s.id, "generation": s.generation, "phase": s.phase});
-        s.responses.insert(b.request_id.clone(), r);
+    let mut c = lock(&cref);
+    if !c.responses.contains_key(&b.request_id) {
+        c.halt("stop", Some(&b.request_id), json!({"reason": "user_stop"}));
+        c.log(Some(&b.request_id), "stop", json!({}));
+        let r = merge(
+            &json!({"clientId": c.id, "generation": c.generation}),
+            c.state(),
+        );
+        c.responses.insert(b.request_id.clone(), r);
     }
-    Ok(Json(s.responses[&b.request_id].clone()))
+    Ok(Json(c.responses[&b.request_id].clone()))
 }
 
 /// Like stop, accepts any generation: the user asked for it, and errors bump the generation.
@@ -632,33 +674,34 @@ async fn retry(
     headers: HeaderMap,
     b: Result<Json<RetryBody>, JsonRejection>,
 ) -> ApiResult<Json<Value>> {
-    let sref = get_session(&app, &id, bearer(&headers))?;
+    let cref = get_client(&app, &id, bearer(&headers))?;
     let b = body(b)?;
-    let mut s = lock(&sref);
-    if let Some(r) = s.responses.get(&b.request_id) {
+    let mut c = lock(&cref);
+    if let Some(r) = c.responses.get(&b.request_id) {
         return Ok(Json(r.clone()));
     }
-    if b.from == RetryFrom::LastConfirmedStep && s.destination.is_none() {
+    if b.from == RetryFrom::LastConfirmedStep && c.session.is_none() {
         return Err(bad_request("No confirmed step to resume from."));
     }
-    s.reset();
-    s.nav_failures = 0;
-    s.last_spoken = None;
+    c.reset();
+    c.stopped = false;
     if b.from == RetryFrom::DestinationPrompt {
-        s.phase = "awaiting_destination";
-        s.step = app.route.start_step_id.clone();
-        s.destination = None;
-    } else {
-        s.phase = "navigating";
+        c.session = None;
+    } else if let Some(s) = &mut c.session {
+        // Same session and step, but old frames and the previous output no longer describe the scene.
+        s.frames.clear();
+        s.previous = None;
+        s.arrived = false;
+        s.nav_failures = 0;
     }
-    let state = s.state();
-    s.emit("state", Some(&b.request_id), state.clone());
-    s.log(Some(&b.request_id), "retry", json!({}));
+    let state = c.state();
+    c.emit("state", Some(&b.request_id), state.clone());
+    c.log(Some(&b.request_id), "retry", json!({}));
     let r = merge(
-        &json!({"sessionId": s.id, "generation": s.generation}),
+        &json!({"clientId": c.id, "generation": c.generation}),
         state,
     );
-    s.responses.insert(b.request_id, r.clone());
+    c.responses.insert(b.request_id, r.clone());
     Ok(Json(r))
 }
 
@@ -667,47 +710,38 @@ async fn trace(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    let sref = get_session(&app, &id, bearer(&headers))?;
-    let s = lock(&sref);
-    Ok(Json(json!({"sessionId": s.id, "entries": s.entries})))
+    let cref = get_client(&app, &id, bearer(&headers))?;
+    let c = lock(&cref);
+    Ok(Json(json!({"clientId": c.id, "entries": c.entries})))
 }
 
 async fn handle_utterance(
     app: App,
-    sref: SessionRef,
+    cref: ClientRef,
     m: Meta,
-    transcript: Option<String>,
-    audio: Option<(Vec<u8>, String)>,
+    (audio, content_type): (Vec<u8>, String),
     frame: Option<Vec<u8>>,
 ) {
     let (started_gen, phase) = {
-        let s = lock(&sref);
-        (s.generation, s.phase)
+        let c = lock(&cref);
+        (c.generation, c.phase())
     };
     let rid = Some(m.request_id.as_str());
     let mut timings = serde_json::Map::new();
-    let transcript = match audio {
-        Some((bytes, content_type)) => {
-            let t = now_ms();
-            match app.pipeline.transcribe(bytes, &content_type).await {
-                Ok(text) => {
-                    timings.insert("stt".into(), json!(now_ms() - t));
-                    text
-                }
-                Err(e) => {
-                    let mut s = lock(&sref);
-                    if s.generation == started_gen {
-                        s.log(rid, "utterance", json!({"error": format!("stt: {e}")}));
-                        let data = json!({"code": "upstream_unavailable", "stage": "stt", "text": UNAVAILABLE, "retryable": true});
-                        s.halt("error", rid, data);
-                    }
-                    return;
-                }
+    let t = now_ms();
+    let transcript = match app.pipeline.transcribe(audio, &content_type).await {
+        Ok(text) => text.trim().to_string(),
+        Err(e) => {
+            let mut c = lock(&cref);
+            if c.generation == started_gen {
+                c.log(rid, "utterance", json!({"error": format!("stt: {e}")}));
+                let data = json!({"code": "upstream_unavailable", "stage": "stt", "text": UNAVAILABLE, "retryable": true});
+                c.halt("error", rid, data);
             }
+            return;
         }
-        None => transcript.unwrap_or_default(),
     };
-    let transcript = transcript.trim().to_string();
+    timings.insert("stt".into(), json!(now_ms() - t));
     let t = now_ms();
     let cmd = if transcript.is_empty() {
         Command::Empty
@@ -719,40 +753,39 @@ async fn handle_utterance(
     timings.insert("command".into(), json!(now_ms() - t));
     timings.insert("total".into(), json!(now_ms() - m.captured_at));
 
-    let mut s = lock(&sref);
-    if s.generation != started_gen {
-        s.log(
+    let mut c = lock(&cref);
+    if c.generation != started_gen {
+        c.log(
             rid,
             "utterance",
             json!({"transcript": transcript, "dropped": "stale_generation"}),
         );
         return;
     }
-    s.log(
+    c.log(
         rid,
         "utterance",
         json!({"transcript": transcript, "command": cmd.name(), "timingsMs": timings}),
     );
     match cmd {
         Command::Start(id) => {
-            let dest = app.destination(&id).clone();
-            if !dest.steps.contains(&s.step) {
-                s.step = dest.steps[0].clone();
+            let same_action = c.phase() == "navigating"
+                && c.session
+                    .as_ref()
+                    .is_some_and(|s| s.destination.destination_id == id);
+            if !same_action {
+                c.start_session(app.destination(&id).clone());
             }
-            s.destination = Some(dest);
-            s.phase = "navigating";
-            s.last_spoken = None;
-            s.nav_failures = 0;
-            let state = s.state();
-            s.emit("state", rid, state);
+            let state = c.state();
+            c.emit("state", rid, state);
             if let Some(frame) = frame {
-                submit_frame(&app, &sref, &mut s, m.clone(), frame);
+                submit_frame(&app, &cref, &mut c, m.clone(), frame);
             }
         }
-        Command::Cancel => s.halt("stop", rid, json!({"reason": "voice_cancel"})),
+        Command::Cancel => c.halt("stop", rid, json!({"reason": "voice_cancel"})),
         other => {
             let reason = other.name();
-            s.emit(
+            c.emit(
                 "needs_input",
                 rid,
                 json!({"reason": reason, "text": ask_again(&app.route, reason)}),
@@ -761,40 +794,45 @@ async fn handle_utterance(
     }
 }
 
-async fn nav_loop(app: App, sref: SessionRef) {
+/// One worker per client at a time: evaluates the newest frame against the session's buffer.
+async fn worker(app: App, cref: ClientRef) {
     loop {
-        let pending = {
-            let mut s = lock(&sref);
-            match s.pending.take() {
-                Some(p) => p,
+        let job = {
+            let mut c = lock(&cref);
+            match c.session.as_mut().and_then(|s| s.pending.take()) {
+                Some(m) => m,
                 None => {
-                    // Same lock as the check, so a frame submitted now always finds nav_task empty.
-                    if s.nav_task == tokio::task::try_id() {
-                        s.nav_task = None;
+                    // Same lock as the check, so a frame submitted now always finds the worker slot empty.
+                    if c.worker == tokio::task::try_id() {
+                        c.worker = None;
                     }
                     return;
                 }
             }
         };
-        process_frame(&app, &sref, pending).await;
+        evaluate(&app, &cref, job).await;
     }
 }
 
-async fn process_frame(app: &App, sref: &SessionRef, p: Pending) {
-    let (started_gen, step, dest) = {
-        let s = lock(sref);
-        (s.generation, s.step.clone(), s.destination.clone())
+async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
+    let (started_gen, session_id, step, dest, frames) = {
+        let c = lock(cref);
+        let Some(s) = &c.session else { return };
+        (
+            c.generation,
+            s.id.clone(),
+            s.step.clone(),
+            s.destination.clone(),
+            s.frames.iter().cloned().collect::<Vec<_>>(),
+        )
     };
-    let Some(dest) = dest else { return };
     let path = &dest.steps;
-    let rid = Some(p.meta.request_id.as_str());
+    let rid = Some(m.request_id.as_str());
     let mut timings = serde_json::Map::new();
-    timings.insert(
-        "upload".into(),
-        json!((p.received - p.meta.captured_at).max(0)),
-    );
-    let mut base =
-        json!({"clientRouteStepId": p.meta.client_route_step_id, "engine": app.pipeline.engine});
+    timings.insert("upload".into(), json!((now_ms() - m.captured_at).max(0)));
+    let mut base = json!({
+        "clientRouteStepId": m.client_route_step_id, "engine": app.pipeline.engine, "framesSent": frames.len(),
+    });
     let allowed: Vec<&String> = path
         .iter()
         .skip_while(|s| **s != step)
@@ -802,99 +840,101 @@ async fn process_frame(app: &App, sref: &SessionRef, p: Pending) {
         .take(1)
         .collect();
     let meta = json!({
-        "requestId": p.meta.request_id, "destinationId": dest.destination_id, "routeStepId": step,
-        "allowedNextStepIds": allowed, "stepHint": app.hint(&step),
+        "requestId": m.request_id, "sessionId": session_id, "destinationId": dest.destination_id,
+        "routeStepId": step, "allowedNextStepIds": allowed, "stepHint": app.hint(&step),
+        "frames": frames.iter().map(|(fm, _)| json!({"requestId": fm.request_id, "capturedAt": fm.captured_at})).collect::<Vec<_>>(),
     });
 
     let t = now_ms();
-    let nav = match app.pipeline.navigate(p.frame, meta).await {
+    let images = frames.into_iter().map(|(_, data)| data).collect();
+    let nav = match app.pipeline.navigate(images, meta).await {
         Ok(nav) => nav,
         Err(e) => {
-            let mut s = lock(sref);
-            if s.generation != started_gen {
+            let mut c = lock(cref);
+            if c.generation != started_gen {
                 return;
             }
-            s.nav_failures += 1;
-            s.log(
+            let failures = c.session.as_mut().map_or(0, |s| {
+                s.nav_failures += 1;
+                s.nav_failures
+            });
+            c.log(
                 rid,
                 "frame",
                 merge(&base, json!({"error": format!("navigate: {e}")})),
             );
-            if s.nav_failures >= NAV_FAILURES_BEFORE_ERROR {
+            if failures >= NAV_FAILURES_BEFORE_ERROR {
                 let data = json!({"code": "upstream_unavailable", "stage": "navigate", "text": UNAVAILABLE, "retryable": true});
-                s.halt("error", rid, data);
+                c.halt("error", rid, data);
             }
             return;
         }
     };
     timings.insert("navigate".into(), json!(now_ms() - t));
-    let last = {
-        let mut s = lock(sref);
-        if s.generation != started_gen {
-            s.log(
-                rid,
-                "frame",
-                merge(&base, json!({"dropped": "stale_generation"})),
-            );
-            return;
-        }
-        s.nav_failures = 0;
-        s.last_spoken.clone()
-    };
     base = merge(
         &base,
         json!({"confidence": nav["confidence"], "observation": nav["observation"]}),
     );
+    let output = app.pipeline.validate(&nav, &step, path);
 
-    let (action, direction, new_step, uncertain) = app.pipeline.validate(&nav, &step, path);
-    let t = now_ms();
-    let (speak, reason) = app
-        .pipeline
-        .decide(&action, &new_step, uncertain, last.as_ref(), t);
-    timings.insert("decide".into(), json!(now_ms() - t));
-    // Jev answers typed questions but does not generate text, so the writer is a template.
-    let text =
-        speak.then(|| pipeline::template(&action, direction.as_deref(), uncertain, &dest.label));
-
-    let mut s = lock(sref);
-    if s.generation != started_gen {
-        s.log(
+    let mut c = lock(cref);
+    if c.generation != started_gen {
+        c.log(
             rid,
             "frame",
             merge(
                 &base,
-                json!({"action": action, "dropped": "stale_generation"}),
+                json!({"action": output.action, "dropped": "stale_generation"}),
             ),
         );
         return;
     }
-    timings.insert("total".into(), json!(now_ms() - p.meta.captured_at));
-    s.step = new_step.clone();
-    if action == "arrived" {
-        s.phase = "arrived";
+    let s = c
+        .session
+        .as_mut()
+        .expect("same generation keeps the session");
+    s.nav_failures = 0;
+    let now = now_ms();
+    let (speak, reason) =
+        app.pipeline
+            .should_speak(&output, s.previous.as_ref(), s.last_spoken_at, now);
+    // Jev answers typed questions but does not generate text, so the sentence is a template.
+    let text = speak.then(|| {
+        pipeline::template(
+            &output.action,
+            output.direction.as_deref(),
+            output.uncertain,
+            &dest.label,
+        )
+    });
+    s.step = output.step.clone();
+    s.arrived = output.action == "arrived";
+    s.previous = Some(output.clone());
+    if speak {
+        s.last_spoken_at = now;
     }
+    timings.insert("total".into(), json!(now_ms() - m.captured_at));
+
     if let Some(text) = &text {
-        s.last_spoken = Some(Spoken {
-            action: action.clone(),
-            route_step_id: new_step.clone(),
-            uncertain,
-            at: now_ms(),
-        });
-        s.emit("guidance", rid, json!({
-            "guidanceId": uuid::Uuid::new_v4().to_string(), "text": text, "action": action, "direction": direction,
-            "routeStepId": step, "nextRouteStepId": new_step, "uncertain": uncertain,
-            "debug": {"engine": app.pipeline.engine, "timingsMs": timings},
-        }));
+        c.emit(
+            "guidance",
+            rid,
+            json!({
+                "guidanceId": uuid::Uuid::new_v4().to_string(), "text": text, "action": output.action,
+                "direction": output.direction, "routeStepId": step, "nextRouteStepId": output.step,
+                "uncertain": output.uncertain, "debug": {"engine": app.pipeline.engine, "timingsMs": timings},
+            }),
+        );
     } else {
-        let hb = s.heartbeat(rid, Some(reason));
-        s.emit("heartbeat", rid, hb);
+        let hb = c.heartbeat(rid, Some(reason));
+        c.emit("heartbeat", rid, hb);
     }
-    s.log(
+    c.log(
         rid,
         "frame",
         merge(
             &base,
-            json!({"action": action, "spoke": speak, "text": text, "timingsMs": timings}),
+            json!({"action": output.action, "spoke": speak, "text": text, "timingsMs": timings}),
         ),
     );
 }
@@ -916,13 +956,13 @@ fn router(app: App) -> Router {
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
     Router::new()
         .route("/v1/health", get(health))
-        .route("/v1/sessions", post(create_session))
-        .route("/v1/sessions/{id}/events", get(events))
-        .route("/v1/sessions/{id}/utterances", post(utterance))
-        .route("/v1/sessions/{id}/frames", post(frames))
-        .route("/v1/sessions/{id}/stop", post(stop))
-        .route("/v1/sessions/{id}/retry", post(retry))
-        .route("/v1/sessions/{id}/trace", get(trace))
+        .route("/v1/clients", post(create_client))
+        .route("/v1/clients/{id}/events", get(events))
+        .route("/v1/clients/{id}/utterances", post(utterance))
+        .route("/v1/clients/{id}/frames", post(frames))
+        .route("/v1/clients/{id}/stop", post(stop))
+        .route("/v1/clients/{id}/retry", post(retry))
+        .route("/v1/clients/{id}/trace", get(trace))
         .layer(cors)
         .with_state(app)
 }
@@ -949,11 +989,18 @@ mod tests {
     use super::*;
     use reqwest::multipart::{Form, Part};
 
+    #[derive(Default)]
+    struct FakeNav {
+        answer: Value,
+        delay_ms: u64,
+        frames_seen: usize,
+    }
+
     struct Harness {
         base: String,
         http: reqwest::Client,
         app: App,
-        nav: Arc<Mutex<(Value, u64)>>, // fake VLA answer and delay in ms
+        nav: Arc<Mutex<FakeNav>>,
     }
 
     async fn serve(router: Router) -> String {
@@ -964,21 +1011,45 @@ mod tests {
     }
 
     async fn harness() -> Harness {
-        let nav: Arc<Mutex<(Value, u64)>> = Arc::new(Mutex::new((json!({}), 0)));
+        let nav = Arc::new(Mutex::new(FakeNav::default()));
         let fake = nav.clone();
         let fake_vla = Router::new().route(
             "/v1/navigate",
-            post(move |_: Multipart| {
+            post(move |mut mp: Multipart| {
                 let fake = fake.clone();
                 async move {
-                    let (answer, delay) = fake.lock().unwrap().clone();
+                    let mut frames = 0;
+                    while let Some(f) = mp.next_field().await.unwrap() {
+                        frames += usize::from(f.name() == Some("frames"));
+                    }
+                    let (answer, delay) = {
+                        let mut n = fake.lock().unwrap();
+                        n.frames_seen = frames;
+                        (n.answer.clone(), n.delay_ms)
+                    };
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                     Json(answer)
                 }
             }),
         );
+        // Fake STT: the "audio" bytes are the transcript.
+        let fake_stt = Router::new().route(
+            "/stt",
+            post(|mut mp: Multipart| async move {
+                let audio = mp
+                    .next_field()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap();
+                Json(json!({"transcript": String::from_utf8_lossy(&audio)}))
+            }),
+        );
         let mut pipeline = Pipeline::from_env();
         pipeline.nav_url = serve(fake_vla).await;
+        pipeline.stt_url = format!("{}/stt", serve(fake_stt).await);
         pipeline.jev_api_key = String::new();
         let app = Arc::new(AppState::new(load_route(), pipeline));
         Harness {
@@ -1000,6 +1071,13 @@ mod tests {
             .unwrap()
     }
 
+    fn audio(text: &str) -> Part {
+        Part::bytes(text.as_bytes().to_vec())
+            .file_name("a.webm")
+            .mime_str("audio/webm")
+            .unwrap()
+    }
+
     async fn next(rx: &mut broadcast::Receiver<Value>) -> Value {
         tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
@@ -1008,23 +1086,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_loop_stale_inputs_and_stop() {
+    async fn sessions_frames_worker_and_stop() {
         let h = harness().await;
-        let s: Value = h
+        let c: Value = h
             .http
-            .post(format!("{}/v1/sessions", h.base))
+            .post(format!("{}/v1/clients", h.base))
             .send()
             .await
             .unwrap()
             .json()
             .await
             .unwrap();
-        let (sid, token) = (
-            s["sessionId"].as_str().unwrap(),
-            s["sessionToken"].as_str().unwrap(),
+        let (cid, token) = (
+            c["clientId"].as_str().unwrap(),
+            c["clientToken"].as_str().unwrap(),
         );
-        let url = |p: &str| format!("{}/v1/sessions/{sid}/{p}", h.base);
-        let mut rx = h.app.sessions.lock().unwrap()[sid]
+        let url = |p: &str| format!("{}/v1/clients/{cid}/{p}", h.base);
+        let mut rx = h.app.clients.lock().unwrap()[cid]
             .lock()
             .unwrap()
             .events
@@ -1039,18 +1117,46 @@ mod tests {
                 .multipart(form)
                 .send()
         };
+        let say = |rid: &str, generation: i64, seq: i64, text: &str| {
+            let form = Form::new()
+                .text("meta", meta(rid, generation, seq, now_ms()))
+                .part("audio", audio(text));
+            h.http
+                .post(url("utterances"))
+                .bearer_auth(token)
+                .multipart(form)
+                .send()
+        };
+        let set_nav = |answer: Value, delay_ms: u64| {
+            let mut n = h.nav.lock().unwrap();
+            n.answer = answer;
+            n.delay_ms = delay_ms;
+        };
+        let frames_seen = || h.nav.lock().unwrap().frames_seen;
 
-        // No token: 401.
+        // No token: 401. Transcript instead of audio: 400.
         assert_eq!(h.http.get(url("trace")).send().await.unwrap().status(), 401);
+        let form = Form::new()
+            .text("meta", meta("t0", 1, 0, now_ms()))
+            .text("transcript", "coffee");
+        let r = h
+            .http
+            .post(url("utterances"))
+            .bearer_auth(token)
+            .multipart(form)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400);
 
-        // Destination by voice, first frame attached.
-        *h.nav.lock().unwrap() = (
+        // Audio with the first frame starts session 1.
+        set_nav(
             json!({"action": "continue", "proposedNextStepId": "corridor", "confidence": 0.9}),
             0,
         );
         let form = Form::new()
             .text("meta", meta("u1", 1, 0, now_ms()))
-            .text("transcript", "take me to the coffee")
+            .part("audio", audio("take me to the coffee"))
             .part("frame", jpeg());
         let r = h
             .http
@@ -1066,65 +1172,107 @@ mod tests {
             (ev["type"].as_str(), ev["phase"].as_str()),
             (Some("state"), Some("navigating"))
         );
+        let session1 = ev["sessionId"].as_str().unwrap().to_string();
         let ev = next(&mut rx).await;
-        assert_eq!(ev["type"], "guidance");
-        assert_eq!(ev["text"], "Keep going straight.");
-        assert_eq!(ev["nextRouteStepId"], "corridor");
-
-        // Replayed requestId returns the original response; old sequence and old capture are rejected.
-        let form = Form::new()
-            .text("meta", meta("u1", 1, 0, now_ms()))
-            .text("transcript", "x");
-        let r = h
-            .http
-            .post(url("utterances"))
-            .bearer_auth(token)
-            .multipart(form)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(r.status(), 202);
         assert_eq!(
-            post_frame("f0", 1, 0, now_ms()).await.unwrap().status(),
+            (ev["type"].as_str(), ev["text"].as_str()),
+            (Some("guidance"), Some("Keep going straight."))
+        );
+        assert_eq!(frames_seen(), 1);
+
+        // Replays, old sequences and old captures are rejected without side effects.
+        assert_eq!(say("u1", 2, 0, "bathroom").await.unwrap().status(), 202);
+        assert_eq!(
+            post_frame("f0", 2, 0, now_ms()).await.unwrap().status(),
             409
         );
         assert_eq!(
-            post_frame("f1", 1, 1, now_ms() - 60_000)
+            post_frame("f1", 2, 1, now_ms() - 60_000)
                 .await
                 .unwrap()
                 .status(),
             422
         );
 
-        // The VLA proposes a step off the route: no progress, the user is told to wait.
-        *h.nav.lock().unwrap() = (
-            json!({"action": "arrived", "proposedNextStepId": "bathroom", "confidence": 0.9}),
+        // Same output as before: the worker stays quiet. The buffer caps at 5 frames.
+        for seq in 2..8 {
+            assert_eq!(
+                post_frame(&format!("f{seq}"), 2, seq, now_ms())
+                    .await
+                    .unwrap()
+                    .status(),
+                202
+            );
+            let ev = next(&mut rx).await;
+            assert_eq!(
+                (ev["type"].as_str(), ev["quietReason"].as_str()),
+                (Some("heartbeat"), Some("unchanged"))
+            );
+        }
+        assert_eq!(frames_seen(), 5);
+
+        // A different output is spoken.
+        set_nav(
+            json!({"action": "turn", "direction": "left", "proposedNextStepId": "corridor", "confidence": 0.9}),
             0,
         );
         assert_eq!(
-            post_frame("f2", 1, 2, now_ms()).await.unwrap().status(),
+            post_frame("f8", 2, 8, now_ms()).await.unwrap().status(),
+            202
+        );
+        assert_eq!(next(&mut rx).await["text"], "Turn left.");
+
+        // Same action again: same session, same generation.
+        assert_eq!(
+            say("u2", 2, 9, "the coffee please").await.unwrap().status(),
             202
         );
         let ev = next(&mut rx).await;
         assert_eq!(
-            (ev["action"].as_str(), ev["nextRouteStepId"].as_str()),
-            (Some("wait"), Some("corridor"))
+            (ev["sessionId"].as_str(), ev["generation"].as_i64()),
+            (Some(session1.as_str()), Some(2))
         );
 
-        // Stop while the VLA is still thinking: the late answer is never emitted.
-        *h.nav.lock().unwrap() = (
-            json!({"action": "turn", "direction": "left", "proposedNextStepId": "counter", "confidence": 0.9}),
+        // Different action: new session, new generation, empty buffer and no previous output.
+        assert_eq!(
+            say("u3", 2, 10, "where is the toilet")
+                .await
+                .unwrap()
+                .status(),
+            202
+        );
+        let ev = next(&mut rx).await;
+        let session2 = ev["sessionId"].as_str().unwrap().to_string();
+        assert_ne!(session2, session1);
+        assert_eq!(
+            (ev["generation"].as_i64(), ev["destinationId"].as_str()),
+            (Some(3), Some("bathroom"))
+        );
+        assert_eq!(
+            post_frame("f11", 2, 11, now_ms()).await.unwrap().status(),
+            409
+        );
+        assert_eq!(
+            post_frame("f12", 3, 12, now_ms()).await.unwrap().status(),
+            202
+        );
+        assert_eq!(next(&mut rx).await["text"], "Turn left.");
+        assert_eq!(frames_seen(), 1);
+
+        // Stop while the navigation model is still thinking: the late answer is never emitted.
+        set_nav(
+            json!({"action": "turn", "direction": "right", "proposedNextStepId": "bathroom", "confidence": 0.9}),
             300,
         );
         assert_eq!(
-            post_frame("f3", 1, 3, now_ms()).await.unwrap().status(),
+            post_frame("f13", 3, 13, now_ms()).await.unwrap().status(),
             202
         );
         let r: Value = h
             .http
             .post(url("stop"))
             .bearer_auth(token)
-            .json(&json!({"requestId": "s1", "generation": 1}))
+            .json(&json!({"requestId": "s1", "generation": 3}))
             .send()
             .await
             .unwrap()
@@ -1133,22 +1281,18 @@ mod tests {
             .unwrap();
         assert_eq!(
             (r["generation"].as_i64(), r["phase"].as_str()),
-            (Some(2), Some("stopped"))
+            (Some(4), Some("stopped"))
         );
         assert_eq!(next(&mut rx).await["type"], "stop");
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(rx.try_recv().is_err(), "no event after stop");
-        assert_eq!(
-            post_frame("f4", 1, 4, now_ms()).await.unwrap().status(),
-            409
-        );
 
-        // Retry from the last confirmed step keeps route progress.
+        // Retry from the last confirmed step keeps the session and its step.
         let r: Value = h
             .http
             .post(url("retry"))
             .bearer_auth(token)
-            .json(&json!({"requestId": "r1", "generation": 2, "from": "last_confirmed_step"}))
+            .json(&json!({"requestId": "r1", "generation": 4, "from": "last_confirmed_step"}))
             .send()
             .await
             .unwrap()
@@ -1158,10 +1302,16 @@ mod tests {
         assert_eq!(
             (
                 r["phase"].as_str(),
+                r["sessionId"].as_str(),
                 r["routeStepId"].as_str(),
                 r["generation"].as_i64()
             ),
-            (Some("navigating"), Some("corridor"), Some(3))
+            (
+                Some("navigating"),
+                Some(session2.as_str()),
+                Some("corridor"),
+                Some(5)
+            )
         );
 
         // Trace is readable and holds no media or token.
@@ -1175,6 +1325,6 @@ mod tests {
             .text()
             .await
             .unwrap();
-        assert!(t.contains("\"kind\":\"frame\"") && !t.contains(token));
+        assert!(t.contains("\"framesSent\":5") && !t.contains(token));
     }
 }

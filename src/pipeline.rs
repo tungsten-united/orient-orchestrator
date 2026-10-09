@@ -1,4 +1,5 @@
-//! Model calls behind the orchestrator: STT, command (TypeSafe Jev), navigation, decider, writer.
+//! Model calls behind the orchestrator: STT, command (TypeSafe Jev), navigation, the worker's
+//! comparison rule, and the sentence templates.
 //!
 //! Every model output is validated here. Nothing in this module changes session state.
 
@@ -60,12 +61,13 @@ impl Command {
     }
 }
 
-#[derive(Clone)]
-pub struct Spoken {
+/// A validated navigation output. The worker compares each one with the session's previous one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Output {
     pub action: String,
-    pub route_step_id: String,
+    pub direction: Option<String>,
+    pub step: String,
     pub uncertain: bool,
-    pub at: i64,
 }
 
 pub struct Pipeline {
@@ -247,13 +249,15 @@ impl Pipeline {
         }
     }
 
-    pub async fn navigate(&self, frame: Vec<u8>, meta: Value) -> Result<Value, BoxError> {
-        let form = Form::new().text("meta", meta.to_string()).part(
-            "frame",
-            Part::bytes(frame)
-                .file_name("frame.jpg")
-                .mime_str("image/jpeg")?,
-        );
+    /// Sends the session's last frames, oldest first, as repeated `frames` parts.
+    pub async fn navigate(&self, frames: Vec<Vec<u8>>, meta: Value) -> Result<Value, BoxError> {
+        let mut form = Form::new().text("meta", meta.to_string());
+        for (i, frame) in frames.into_iter().enumerate() {
+            let part = Part::bytes(frame)
+                .file_name(format!("frame{i}.jpg"))
+                .mime_str("image/jpeg")?;
+            form = form.part("frames", part);
+        }
         let out: Value = self
             .http
             .post(format!("{}/v1/navigate", self.nav_url))
@@ -270,13 +274,8 @@ impl Pipeline {
         Ok(out)
     }
 
-    /// Turn a VLA answer into (action, direction, new step, uncertain). Only the route can move the step.
-    pub fn validate(
-        &self,
-        nav: &Value,
-        step: &str,
-        path: &[String],
-    ) -> (String, Option<String>, String, bool) {
+    /// Turn a VLA answer into an Output. Only the route can move the step.
+    pub fn validate(&self, nav: &Value, step: &str, path: &[String]) -> Output {
         let next = path
             .iter()
             .position(|p| p == step)
@@ -284,7 +283,12 @@ impl Pipeline {
         let action = nav["action"].as_str().unwrap_or("");
         let direction = nav["direction"].as_str();
         let proposed = nav["proposedNextStepId"].as_str().unwrap_or(step);
-        let wait = |uncertain| ("wait".to_string(), None, step.to_string(), uncertain);
+        let wait = |uncertain| Output {
+            action: "wait".into(),
+            direction: None,
+            step: step.into(),
+            uncertain,
+        };
 
         if !ACTIONS.contains(&action)
             || (proposed != step && next.map(String::as_str) != Some(proposed))
@@ -303,39 +307,32 @@ impl Pipeline {
         if action == "turn" && !direction.is_some_and(|d| DIRECTIONS.contains(&d)) {
             return wait(false);
         }
-        let direction = if action == "turn" {
-            direction.map(String::from)
-        } else {
-            None
-        };
-        (action.to_string(), direction, proposed.to_string(), false)
+        Output {
+            action: action.into(),
+            direction: if action == "turn" {
+                direction.map(String::from)
+            } else {
+                None
+            },
+            step: proposed.into(),
+            uncertain: false,
+        }
     }
 
-    /// Utterance decider, rules version. If rules prove too rigid, this is a natural Jev Noul question.
-    pub fn decide(
+    /// The worker's rule: speak when the output differs from the session's previous output,
+    /// or as a reminder after `repeat_ms` of the same output.
+    pub fn should_speak(
         &self,
-        action: &str,
-        step: &str,
-        uncertain: bool,
-        last: Option<&Spoken>,
+        output: &Output,
+        previous: Option<&Output>,
+        last_spoken_at: i64,
         now: i64,
     ) -> (bool, &'static str) {
-        if action == "stop" || action == "arrived" {
-            return (true, if action == "stop" { "stop" } else { "arrived" });
-        }
-        let Some(last) = last else {
-            return (true, "first");
-        };
-        if action != last.action {
-            (true, "action_changed")
-        } else if step != last.route_step_id {
-            (true, "step_changed")
-        } else if uncertain && !last.uncertain {
-            (true, "uncertain")
-        } else if now - last.at >= self.repeat_ms {
-            (true, "repeat_interval")
-        } else {
-            (false, "unchanged")
+        match previous {
+            None => (true, "first"),
+            Some(p) if p != output => (true, "changed"),
+            _ if now - last_spoken_at >= self.repeat_ms => (true, "repeat_interval"),
+            _ => (false, "unchanged"),
         }
     }
 }
@@ -348,50 +345,67 @@ mod tests {
         ["start", "corridor", "counter"].map(String::from).to_vec()
     }
 
+    fn out(action: &str, direction: Option<&str>, step: &str, uncertain: bool) -> Output {
+        Output {
+            action: action.into(),
+            direction: direction.map(String::from),
+            step: step.into(),
+            uncertain,
+        }
+    }
+
     #[test]
     fn validate_only_moves_along_the_route() {
         let p = Pipeline::from_env();
         let ok = json!({"action": "continue", "proposedNextStepId": "corridor", "confidence": 0.9});
         assert_eq!(
             p.validate(&ok, "start", &path()),
-            ("continue".into(), None, "corridor".into(), false)
+            out("continue", None, "corridor", false)
         );
         let skip =
             json!({"action": "continue", "proposedNextStepId": "counter", "confidence": 0.9});
-        assert_eq!(p.validate(&skip, "start", &path()).0, "wait");
+        assert_eq!(p.validate(&skip, "start", &path()).action, "wait");
         let unsure =
             json!({"action": "continue", "proposedNextStepId": "corridor", "confidence": 0.2});
         assert_eq!(
             p.validate(&unsure, "start", &path()),
-            ("wait".into(), None, "start".into(), true)
+            out("wait", None, "start", true)
         );
         let early =
             json!({"action": "arrived", "proposedNextStepId": "corridor", "confidence": 0.9});
-        assert_eq!(p.validate(&early, "start", &path()).0, "wait");
+        assert_eq!(p.validate(&early, "start", &path()).action, "wait");
         let turn = json!({"action": "turn", "direction": "up", "confidence": 0.9});
-        assert_eq!(p.validate(&turn, "start", &path()).0, "wait");
+        assert_eq!(p.validate(&turn, "start", &path()).action, "wait");
     }
 
     #[test]
-    fn decide_speaks_on_change_or_after_interval() {
+    fn speaks_only_when_output_differs_from_previous() {
         let p = Pipeline::from_env();
-        let last = Spoken {
-            action: "continue".into(),
-            route_step_id: "corridor".into(),
-            uncertain: false,
-            at: 0,
-        };
+        let prev = out("turn", Some("left"), "corridor", false);
+        assert_eq!(p.should_speak(&prev, None, 0, 1000), (true, "first"));
         assert_eq!(
-            p.decide("continue", "corridor", false, Some(&last), 1000),
+            p.should_speak(&prev, Some(&prev), 0, 1000),
             (false, "unchanged")
         );
-        assert!(p.decide("turn", "corridor", false, Some(&last), 1000).0);
-        assert!(p.decide("continue", "counter", false, Some(&last), 1000).0);
-        assert!(
-            p.decide("continue", "corridor", false, Some(&last), p.repeat_ms)
-                .0
+        let right = out("turn", Some("right"), "corridor", false);
+        assert_eq!(
+            p.should_speak(&right, Some(&prev), 0, 1000),
+            (true, "changed")
         );
-        assert!(p.decide("arrived", "corridor", false, Some(&last), 1000).0);
+        let unsure = out("wait", None, "corridor", true);
+        assert!(
+            p.should_speak(
+                &unsure,
+                Some(&out("wait", None, "corridor", false)),
+                0,
+                1000
+            )
+            .0
+        );
+        assert_eq!(
+            p.should_speak(&prev, Some(&prev), 0, p.repeat_ms),
+            (true, "repeat_interval")
+        );
     }
 
     #[test]
