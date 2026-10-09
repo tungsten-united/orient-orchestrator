@@ -82,7 +82,7 @@ jobs:
           # and a long timeout so the SSE stream is not cut.
           gcloud run deploy orient-orchestrator-staging --image "$IMAGE" --region "$REGION" \
             --service-account "$RUNTIME_SA" --allow-unauthenticated --max-instances 1 --min-instances 0 --no-cpu-throttling --timeout 3600 \
-            --set-env-vars "^@^NAV_URL=$NAV_URL@STT_URL=$STT_URL@DEBUG_PAGE=1@GIT_SHA=$GITHUB_SHA@ALLOW_ORIGINS=$ALLOW_ORIGINS" \
+            --set-env-vars "^@^NAV_URL=$NAV_URL@STT_URL=$STT_URL@DEBUG_PAGE=1@TRACE_STDOUT=1@GIT_SHA=$GITHUB_SHA@ALLOW_ORIGINS=$ALLOW_ORIGINS" \
             $SECRETS --quiet
 
       - name: Smoke test

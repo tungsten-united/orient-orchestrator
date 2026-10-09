@@ -78,6 +78,21 @@ Then, in GitHub, create the environment `staging` (Settings > Environments) with
 | `ALLOW_ORIGINS` | optional: the web app's staging origin (default `*`) |
 | `TYPESAFE_SECRET` | optional: name of a Secret Manager secret holding the TypeSafe key. Grant the Cloud Run runtime service account `roles/secretmanager.secretAccessor` on it |
 
+### Session logs
+
+Staging prints every trace entry to Cloud Logging. Each entry has `clientId`, `sessionId`, `requestId`, `kind`, the step's outcome and timings, and which app produced it: `commit`, `version` and `routeId`. Find them in Logs Explorer, or:
+
+```bash
+# One session
+gcloud logging read 'resource.labels.service_name="orient-orchestrator-staging" AND jsonPayload.sessionId="<id>"' \
+  --project tungsten-united --order asc --format 'value(jsonPayload)'
+# Everything one release produced
+gcloud logging read 'resource.labels.service_name="orient-orchestrator-staging" AND jsonPayload.commit="<sha>"' \
+  --project tungsten-united --freshness 7d --format json
+```
+
+Logs are kept 30 days.
+
 To require approval before each release, add required reviewers to the `staging` environment. If your organization blocks public services (`allUsers`), `--allow-unauthenticated` fails; ask an org admin, or put the services behind IAP.
 
 ## Configuration
@@ -100,7 +115,8 @@ To require approval before each release, add required reviewers to the `staging`
 | `TRACE_PATH` | unset | Also append the run trace as JSON lines to this file |
 | `ALLOW_ORIGINS` | `*` | CORS origins, comma separated |
 | `DEBUG_PAGE` | unset | Serve the debug page at `/debug` (local runs and staging) |
-| `GIT_SHA` | unset | Commit shown by `/v1/health`; set by the staging deploy |
+| `GIT_SHA` | unset | Commit shown by `/v1/health` and stamped on every trace entry; set by the staging deploy |
+| `TRACE_STDOUT` | unset | Also print every trace entry as one JSON line (stored by Cloud Logging on Cloud Run); on in staging |
 
 ## Layout
 
