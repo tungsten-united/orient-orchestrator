@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Orient Debug</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66; --line: #e2e2dc;
+    --accent: #2457d6; --ok: #1f7a3d; --warn: #9a6200; --bad: #b42318; --quiet: #8a8a84;
+    --chip: #efefea; --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141413; --panel: #1d1d1b; --text: #ecece6; --muted: #9a9a92; --line: #33332f;
+      --accent: #7aa2ff; --ok: #5fcf85; --warn: #e3a83a; --bad: #ff7b6e; --quiet: #77776f; --chip: #2a2a27;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, sans-serif; }
+  header { padding: 12px 16px; border-bottom: 1px solid var(--line); display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0; }
+  .status { display: flex; gap: 14px; flex-wrap: wrap; font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  .status b { color: var(--text); font-weight: 600; }
+  main { display: grid; grid-template-columns: 280px 1fr 1.2fr; gap: 12px; padding: 12px 16px; height: calc(100vh - 52px); }
+  @media (max-width: 1000px) { main { grid-template-columns: 1fr; height: auto; } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; overflow: auto; min-height: 0; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 14px 0 6px; }
+  h2:first-child { margin-top: 0; }
+  button { font: inherit; padding: 5px 9px; border: 1px solid var(--line); background: var(--chip); color: var(--text); border-radius: 6px; cursor: pointer; margin: 0 4px 4px 0; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  button.danger { color: var(--bad); }
+  button[aria-pressed="true"] { outline: 2px solid var(--accent); }
+  input[type=text], input[type=number] { font: inherit; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); width: 100%; }
+  label { display: flex; gap: 6px; align-items: center; margin: 4px 0; }
+  .row { display: flex; gap: 6px; }
+  .hint { color: var(--muted); font-size: 12px; margin: 4px 0; }
+  .ev { display: grid; grid-template-columns: 62px 92px 40px 52px 1fr; gap: 6px; padding: 4px 0; border-bottom: 1px solid var(--line); font-size: 13px; align-items: baseline; }
+  .ev .t, .ev .g, .ev .rid { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+  .badge { font-family: var(--mono); font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--chip); justify-self: start; }
+  .sess { font-family: var(--mono); font-size: 11px; padding: 1px 5px; border-radius: 4px; color: #fff; justify-self: start; }
+  .k-guidance .badge { background: var(--ok); color: #fff; }
+  .k-needs_input .badge { background: var(--warn); color: #fff; }
+  .k-stop .badge, .k-error .badge { background: var(--bad); color: #fff; }
+  .k-heartbeat { color: var(--quiet); }
+  .k-request .badge { background: transparent; border: 1px solid var(--line); }
+  .k-request.fail { color: var(--bad); }
+  .k-sys { color: var(--accent); font-weight: 600; }
+  .ignored { opacity: .45; text-decoration: line-through; }
+  .divider { padding: 6px 0; font-size: 12px; color: var(--accent); border-bottom: 1px dashed var(--accent); }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  th, td { text-align: left; padding: 3px 6px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; position: sticky; top: 0; background: var(--panel); }
+  td.mono { font-family: var(--mono); font-size: 11px; }
+  tr.spoke td { color: var(--ok); }
+  tr.dropped td { color: var(--quiet); text-decoration: line-through; }
+  tr.err td { color: var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Orient orchestrator: debug</h1>
+  <div class="status">
+    <span>client <b id="s-client">–</b></span>
+    <span>generation <b id="s-gen">–</b></span>
+    <span>session <b id="s-session">–</b></span>
+    <span>phase <b id="s-phase">–</b></span>
+    <span>destination <b id="s-dest">–</b></span>
+    <span>step <b id="s-step">–</b></span>
+  </div>
+</header>
+<main>
+  <section aria-label="Controls">
+    <h2>Client</h2>
+    <button class="primary" id="start">Start (new client)</button>
+    <button class="danger" id="stop">Stop</button>
+    <div>
+      <button id="retry-step">Retry from last step</button>
+      <button id="retry-prompt">Retry from prompt</button>
+    </div>
+
+    <h2>Say (audio)</h2>
+    <p class="hint">The fake STT turns the audio bytes back into this text.</p>
+    <button data-say="take me to the coffee">"coffee"</button>
+    <button data-say="where is the toilet">"toilet"</button>
+    <button data-say="cancel">"cancel"</button>
+    <button data-say="sing me a song">"sing me a song"</button>
+    <div class="row"><input type="text" id="say-text" placeholder="Anything else…"><button id="say">Say</button></div>
+    <label><input type="checkbox" id="say-frame" checked> Attach a frame</label>
+
+    <h2>Frames</h2>
+    <button id="frame">Send one frame</button>
+    <label><input type="checkbox" id="auto"> Auto-send every <input type="number" id="auto-ms" value="1000" min="100" step="100" style="width:72px"> ms</label>
+
+    <h2>Fake navigation answer</h2>
+    <div id="presets">
+      <button data-preset="continue">continue (stay)</button>
+      <button data-preset="advance">advance a step</button>
+      <button data-preset="left">turn left</button>
+      <button data-preset="right">turn right</button>
+      <button data-preset="arrived">arrived</button>
+      <button data-preset="unsure">low confidence</button>
+      <button data-preset="off_route">off route</button>
+      <button data-preset="fail">HTTP 500</button>
+    </div>
+    <label>Delay <input type="number" id="delay" value="300" min="0" step="100" style="width:80px"> ms</label>
+    <label>Fake nav URL <input type="text" id="nav-url" value="http://localhost:8001"></label>
+
+    <h2>Output</h2>
+    <label><input type="checkbox" id="speak"> Speak guidance aloud</label>
+  </section>
+
+  <section aria-label="Events">
+    <h2>Events and requests, newest first</h2>
+    <p class="hint">Struck-through events have an older generation, so the phone ignores them. Session chips are coloured per session.</p>
+    <div id="events"></div>
+  </section>
+
+  <section aria-label="Run trace">
+    <h2>Run trace (GET /trace), newest first</h2>
+    <table>
+      <thead><tr><th>time</th><th>kind</th><th>req</th><th>session</th><th>gen</th><th>step</th><th>frames</th><th>action</th><th>spoke / text</th><th>dropped / error</th><th>ms (nav / total)</th></tr></thead>
+      <tbody id="trace"></tbody>
+    </table>
+  </section>
+</main>
+
+<script>
+const $ = (s) => document.querySelector(s);
+let C = null;           // { clientId, token, offset, generation, seq, t0 }
+let es = null;
+let frameInFlight = false;
+let autoTimer = null;
+const view = { phase: null, sessionId: null, destinationId: null, routeStepId: null };
+
+const api = (p) => `/v1/clients/${C.clientId}/${p}`;
+const serverNow = () => Date.now() + C.offset;
+const short = (id) => (id ? id.slice(0, 4) : '–');
+const clock = (ms) => ((ms - C.t0) / 1000).toFixed(1).padStart(6, ' ') + 's';
+const hue = (id) => [...(id || '')].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 360, 7);
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+function sessionChip(id) {
+  return id ? `<span class="sess" style="background:hsl(${hue(id)} 55% 42%)">${short(id)}</span>` : '<span></span>';
+}
+
+function renderStatus() {
+  $('#s-client').textContent = C ? short(C.clientId) : '–';
+  $('#s-gen').textContent = C ? C.generation : '–';
+  $('#s-session').textContent = short(view.sessionId);
+  $('#s-phase').textContent = view.phase ?? '–';
+  $('#s-dest').textContent = view.destinationId ?? '–';
+  $('#s-step').textContent = view.routeStepId ?? '–';
+}
+
+function addRow(html, cls = '') {
+  const div = document.createElement('div');
+  div.className = cls;
+  div.innerHTML = html;
+  $('#events').prepend(div);
+}
+
+function addEvent(e, ignored) {
+  const detail = {
+    state: `${e.phase} · ${e.destinationId ?? '–'} · ${e.routeStepId ?? '–'}`,
+    guidance: `“${esc(e.text)}” <span class="rid">${e.action}${e.direction ? ' ' + e.direction : ''} · ${e.routeStepId} → ${e.nextRouteStepId}${e.uncertain ? ' · uncertain' : ''}</span>`,
+    heartbeat: e.quietReason ? `quiet: ${e.quietReason}` : 'keep-alive',
+    needs_input: `${e.reason}: “${esc(e.text)}”`,
+    stop: e.reason,
+    error: `${e.stage}: ${e.code} “${esc(e.text)}”`,
+  }[e.type] ?? '';
+  addRow(
+    `<span class="t">${clock(e.emittedAt - C.offset)}</span><span class="badge">${e.type}</span>` +
+      `<span class="g">g${e.generation}</span>${sessionChip(e.sessionId)}<span>${detail} <span class="rid">${e.requestId ?? ''}</span></span>`,
+    `ev k-${e.type}${ignored ? ' ignored' : ''}`,
+  );
+}
+
+function addRequest(label, status, code) {
+  const ok = status >= 200 && status < 300;
+  addRow(
+    `<span class="t">${clock(Date.now())}</span><span class="badge">→ ${label.split(' ')[0]}</span>` +
+      `<span class="g"></span><span></span><span>${esc(label)} → <b>${status}</b> ${code ?? ''}</span>`,
+    `ev k-request${ok ? '' : ' fail'}`,
+  );
+}
+
+function onEvent(e) {
+  const ignored = e.generation < C.generation;
+  if (e.generation > C.generation) {
+    addRow(`generation ${C.generation} → ${e.generation}${e.sessionId !== view.sessionId ? ' · new session ' + short(e.sessionId) : ''}`, 'divider');
+    C.generation = e.generation;
+  }
+  if (!ignored) {
+    for (const k of ['phase', 'sessionId', 'destinationId', 'routeStepId']) if (k in e) view[k] = e[k];
+    if (e.type === 'guidance') view.routeStepId = e.nextRouteStepId;
+    if (e.type === 'stop' || e.type === 'error') view.phase = 'stopped';
+    if (e.type === 'guidance' && $('#speak').checked) speechSynthesis.speak(new SpeechSynthesisUtterance(e.text));
+  }
+  addEvent(e, ignored);
+  renderStatus();
+}
+
+async function start() {
+  es?.close();
+  const r = await fetch('/v1/clients', { method: 'POST' });
+  const b = await r.json();
+  C = { clientId: b.clientId, token: b.clientToken, offset: b.serverTime - Date.now(), generation: b.generation, seq: 0, t0: Date.now() };
+  Object.assign(view, { phase: b.phase, sessionId: null, destinationId: null, routeStepId: null });
+  $('#events').innerHTML = '';
+  $('#trace').innerHTML = '';
+  addRequest('client created', r.status);
+  es = new EventSource(api('events') + '?token=' + encodeURIComponent(C.token));
+  es.onmessage = (m) => onEvent(JSON.parse(m.data));
+  es.onerror = () => addRow('event stream interrupted, reconnecting…', 'ev k-sys');
+  renderStatus();
+}
+
+async function post(path, body, json) {
+  const headers = { Authorization: 'Bearer ' + C.token };
+  if (json) headers['Content-Type'] = 'application/json';
+  const r = await fetch(api(path), { method: 'POST', headers, body });
+  const data = await r.json().catch(() => ({}));
+  return { status: r.status, data };
+}
+
+function jpeg() {
+  // The orchestrator never decodes images, so a JPEG header is enough for the fake engine.
+  return new Blob([new Uint8Array([0xff, 0xd8, 0xff, 0xd9])], { type: 'image/jpeg' });
+}
+
+function multipart(prefix, parts) {
+  C.seq += 1;
+  const requestId = `${prefix}${C.seq}`;
+  const fd = new FormData();
+  fd.append('meta', JSON.stringify({ requestId, generation: C.generation, sequence: C.seq, capturedAt: serverNow(), clientRouteStepId: view.routeStepId }));
+  for (const [name, blob, file] of parts) fd.append(name, blob, file);
+  return { requestId, fd };
+}
+
+async function say(text) {
+  if (!C) return;
+  const parts = [['audio', new Blob([text], { type: 'audio/webm' }), 'a.webm']];
+  if ($('#say-frame').checked) parts.push(['frame', jpeg(), 'f.jpg']);
+  const { requestId, fd } = multipart('u', parts);
+  const { status, data } = await post('utterances', fd);
+  addRequest(`utterance ${requestId} “${text}” (g${JSON.parse(fd.get('meta')).generation})`, status, data.error?.code);
+}
+
+async function frame() {
+  if (!C || frameInFlight) return;
+  frameInFlight = true;
+  const { requestId, fd } = multipart('f', [['frame', jpeg(), 'f.jpg']]);
+  const { status, data } = await post('frames', fd).finally(() => (frameInFlight = false));
+  addRequest(`frame ${requestId} (g${JSON.parse(fd.get('meta')).generation})`, status, data.error?.code);
+}
+
+async function stop() {
+  if (!C) return;
+  const { status, data } = await post('stop', JSON.stringify({ requestId: 's' + Date.now(), generation: C.generation }), true);
+  addRequest('stop', status, data.error?.code);
+}
+
+async function retry(from) {
+  if (!C) return;
+  const { status, data } = await post('retry', JSON.stringify({ requestId: 'r' + Date.now(), generation: C.generation, from }), true);
+  addRequest(`retry ${from}`, status, data.error?.code);
+}
+
+async function setPreset(preset) {
+  const url = $('#nav-url').value.replace(/\/$/, '') + '/control';
+  try {
+    await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ preset, delayMs: Number($('#delay').value) }) });
+    document.querySelectorAll('[data-preset]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.preset === preset)));
+  } catch {
+    if (C) addRow('fake navigation server unreachable: run `cargo run --example fakes`', 'ev k-sys');
+  }
+}
+
+async function pollTrace() {
+  if (C) {
+    try {
+      const r = await fetch(api('trace'), { headers: { Authorization: 'Bearer ' + C.token } });
+      const { entries } = await r.json();
+      $('#trace').innerHTML = entries.slice(-80).reverse().map((t) => {
+        const cls = t.dropped ? 'dropped' : t.error ? 'err' : t.spoke ? 'spoke' : '';
+        const what = t.kind === 'utterance' ? `${esc(t.transcript ?? '')} → ${t.command ?? ''}` : t.spoke ? `“${esc(t.text)}”` : t.action ?? '';
+        const ms = t.timingsMs ?? {};
+        return `<tr class="${cls}"><td class="mono">${clock(t.at - C.offset)}</td><td>${t.kind}</td><td class="mono">${t.requestId ?? ''}</td>` +
+          `<td>${sessionChip(t.sessionId)}</td><td class="mono">${t.generation}</td><td>${t.routeStepId ?? ''}</td><td>${t.framesSent ?? ''}</td>` +
+          `<td>${t.action ?? ''}</td><td>${what}</td><td>${t.dropped ?? esc(t.error ?? '')}</td><td class="mono">${ms.navigate ?? ms.command ?? ''} / ${ms.total ?? ''}</td></tr>`;
+      }).join('');
+    } catch { /* the server may be restarting */ }
+  }
+  setTimeout(pollTrace, 1000);
+}
+
+function toggleAuto() {
+  clearInterval(autoTimer);
+  if ($('#auto').checked) autoTimer = setInterval(() => view.phase === 'navigating' && frame(), Number($('#auto-ms').value));
+}
+
+$('#start').onclick = start;
+$('#stop').onclick = stop;
+$('#retry-step').onclick = () => retry('last_confirmed_step');
+$('#retry-prompt').onclick = () => retry('destination_prompt');
+$('#frame').onclick = frame;
+$('#say').onclick = () => say($('#say-text').value);
+$('#say-text').onkeydown = (e) => e.key === 'Enter' && say($('#say-text').value);
+document.querySelectorAll('[data-say]').forEach((b) => (b.onclick = () => say(b.dataset.say)));
+document.querySelectorAll('[data-preset]').forEach((b) => (b.onclick = () => setPreset(b.dataset.preset)));
+$('#delay').onchange = () => setPreset(document.querySelector('[data-preset][aria-pressed="true"]')?.dataset.preset ?? 'continue');
+$('#auto').onchange = toggleAuto;
+$('#auto-ms').onchange = toggleAuto;
+setPreset('continue');
+pollTrace();
+renderStatus();
+</script>
+</body>
+</html>

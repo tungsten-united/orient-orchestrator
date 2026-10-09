@@ -19,6 +19,18 @@ NAV_URL=http://gpu-box:8001 cargo run
 cargo test
 ```
 
+## Debug locally
+
+See the server's workflow live, without a phone or real models:
+
+```sh
+cargo run --example fakes    # fake navigation engine on :8001, fake speech-to-text on :8002
+STT_URL=http://localhost:8002/stt DEBUG_PAGE=1 TRACE_PATH=trace.jsonl cargo run
+open http://localhost:8000/debug
+```
+
+The page drives the real API. You can start a client, "say" a destination (the fake speech-to-text turns the audio bytes back into text), send frames by hand or on a timer, choose what the fake navigation engine answers, and press Stop or Retry. Next to the controls it shows the live events, coloured per session, with generation changes and ignored late events. It also shows the run trace, so you can see which outputs were spoken, which were kept quiet, and which were dropped. `/debug` exists only when `DEBUG_PAGE` is set.
+
 ## Configuration
 
 | Env var | Default | Purpose |
@@ -38,6 +50,7 @@ cargo test
 | `REPEAT_MS` | `7000` | The worker repeats unchanged guidance after this |
 | `TRACE_PATH` | unset | Also append the run trace as JSON lines to this file |
 | `ALLOW_ORIGINS` | `*` | CORS origins, comma separated |
+| `DEBUG_PAGE` | unset | Serve the local debug page at `/debug` |
 
 ## Layout
 

@@ -18,7 +18,7 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::sse::{Event, Sse};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -954,7 +954,12 @@ fn router(app: App) -> Router {
         .allow_origin(allow_origin)
         .allow_methods([Method::GET, Method::POST])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
-    Router::new()
+    let mut routes = Router::new();
+    if std::env::var("DEBUG_PAGE").is_ok() {
+        // Local debugging only: drives the API and shows events and the trace live. See examples/fakes.rs.
+        routes = routes.route("/debug", get(|| async { Html(include_str!("debug.html")) }));
+    }
+    routes
         .route("/v1/health", get(health))
         .route("/v1/clients", post(create_client))
         .route("/v1/clients/{id}/events", get(events))
