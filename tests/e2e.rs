@@ -421,3 +421,51 @@ async fn sessions_frames_worker_and_stop() {
         .unwrap();
     assert!(t.contains("\"framesSent\":5") && !t.contains(token));
 }
+
+async fn local_server(vars: &[(&str, &str)]) -> String {
+    let get = |k: &str| {
+        vars.iter()
+            .find(|(n, _)| *n == k)
+            .map(|(_, v)| v.to_string())
+    };
+    let route: Route = serde_json::from_str(include_str!("../src/route.json")).unwrap();
+    let app = Arc::new(AppState::new(route, Pipeline::from_vars(&get), &get));
+    serve(server::router(app), 0).await
+}
+
+#[tokio::test]
+async fn should_serve_debug_page_pointing_at_nav_url_only_when_enabled() {
+    let http = reqwest::Client::new();
+    let off = local_server(&[]).await;
+    assert_eq!(
+        http.get(format!("{off}/debug"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+
+    let on = local_server(&[("DEBUG_PAGE", "1"), ("NAV_URL", "https://fakes.example")]).await;
+    let page = http
+        .get(format!("{on}/debug"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains(r#"id="nav-url" value="https://fakes.example""#));
+}
+
+#[tokio::test]
+async fn should_report_deployed_commit_in_health() {
+    let base = local_server(&[("GIT_SHA", "abc123")]).await;
+    let h: Value = reqwest::get(format!("{base}/v1/health"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(h["commit"], "abc123");
+}

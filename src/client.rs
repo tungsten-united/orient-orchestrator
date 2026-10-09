@@ -79,6 +79,8 @@ pub struct AppState {
     pub pipeline: Pipeline,
     pub limits: Limits,
     trace_path: Option<String>,
+    pub debug_page: bool,
+    pub commit: Option<String>, // GIT_SHA, set by the deploy
 }
 
 pub type App = Arc<AppState>;
@@ -91,6 +93,8 @@ impl AppState {
             pipeline,
             limits: Limits::from_vars(get),
             trace_path: get("TRACE_PATH"),
+            debug_page: get("DEBUG_PAGE").is_some(),
+            commit: get("GIT_SHA"),
         }
     }
 

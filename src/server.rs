@@ -75,8 +75,14 @@ async fn read_parts(limits: &Limits, mut mp: Multipart) -> ApiResult<Parts> {
     Ok(p)
 }
 
-async fn health() -> Json<Value> {
-    Json(json!({"status": "ok", "version": env!("CARGO_PKG_VERSION")}))
+async fn health(State(srv): State<Srv>) -> Json<Value> {
+    Json(json!({"status": "ok", "version": env!("CARGO_PKG_VERSION"), "commit": srv.app.commit}))
+}
+
+/// The debug page, with its fake navigation URL defaulting to this server's NAV_URL.
+fn debug_page(nav_url: &str) -> Html<String> {
+    let default = r#"id="nav-url" value="http://localhost:8001""#;
+    Html(include_str!("debug.html").replace(default, &format!(r#"id="nav-url" value="{nav_url}""#)))
 }
 
 async fn create_client(State(srv): State<Srv>) -> (StatusCode, Json<Value>) {
@@ -173,9 +179,10 @@ pub fn router(app: App) -> Router {
         .allow_methods([Method::GET, Method::POST])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
     let mut routes = Router::new();
-    if get_env("DEBUG_PAGE").is_some() {
-        // Local debugging only: drives the API and shows events and the trace live. See examples/fakes.rs.
-        routes = routes.route("/debug", get(|| async { Html(include_str!("debug.html")) }));
+    if app.debug_page {
+        // Local runs and staging only: drives the API and shows events and the trace live. See examples/fakes.rs.
+        let page = debug_page(&app.pipeline.nav_url);
+        routes = routes.route("/debug", get(|| async { page }));
     }
     let srv = Arc::new(Server {
         app,
