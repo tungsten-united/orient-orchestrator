@@ -29,6 +29,44 @@ Without `TYPESAFE_API_KEY`, the command step falls back to keyword matching on t
 
 **Staging runs on Cloud Run and is released by hand only** (`.github/workflows/deploy-staging.yml`, `workflow_dispatch`). Never add an automatic deploy. One image (`Dockerfile`) holds the server and the fakes (`examples/fakes.rs`, `--command fakes`). Staging uses either the fakes (navigation and ElevenLabs) or the real `NAV_URL` and ElevenLabs API, chosen per release. Because clients live in memory, the server service must keep `--max-instances 1`, `--no-cpu-throttling` (the worker runs between requests) and a long `--timeout` (SSE). Staging also sets `TRACE_STDOUT`, so every trace entry, stamped with `commit`, `version` and `routeId`, lands in Cloud Logging: look there first when a developer reports a problem (queries in README.md, "Session logs"). Staging is used only by developers, so traces may hold transcripts. The debug page (`DEBUG_PAGE`) is on in staging; its fake navigation URL defaults to the server's `NAV_URL`. Setup: README.md, "Staging on Cloud Run". Test the image locally with Podman (there is no Docker on the dev machine): `podman build -t orient-orchestrator:local .`, then `podman run --rm -p 8080:8080 orient-orchestrator:local`. The Podman VM is arm64 while CI builds amd64.
 
+## Credentials and accounts
+
+Never print, log or commit a key. Read secrets from `.env` or Secret Manager inside a subshell and pass them through stdin or env, as below.
+
+**Local runs.** `.env` (gitignored, never committed) holds `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID`. The server does not read `.env` itself; load it into the shell first:
+
+```bash
+set -a; source .env; set +a
+cargo run --example fakes                          # fake navigation on :8001
+NAV_URL=http://localhost:8001 DEBUG_PAGE=1 cargo run   # real ElevenLabs: leave ELEVENLABS_URL unset
+```
+
+The debug page's Say box sends typed text as fake audio, which only the fakes understand. To test real Scribe, send a recorded clip (`ffmpeg -f avfoundation -i ":0" -t 3 -c:a libopus say.webm`) as the `audio` part of `POST /utterances`.
+
+**ElevenLabs account.** It is on the free plan, verified live on 2026-10-10 (Scribe 370 ms, Flash first byte about 0.4 s):
+
+- Free accounts cannot use library voices through the API: ElevenLabs answers `402 paid_plan_required`, and `GET /speech` returns 503. Only built-in (`premade`) voices work. The voice in use is Lily, `pFZP5JQG7iQjIQuC4Bku`. The final voice is the S06 owner's call; a library voice needs at least $5 of credits.
+- The key lacks the `user_read` permission, so it cannot read the account's quota (`/v1/user/subscription`).
+
+**Google Cloud (`tungsten-united`, project number 613464313064, region `europe-west1`).** Shared with tungsten-united/project-description, which created it with its `infra/gcp/setup.sh`. Reuse these resources, don't create parallel ones:
+
+| Resource | Name | Notes |
+| --- | --- | --- |
+| Workload Identity pool / provider | `github` / `github-oidc` | Attribute condition limits which GitHub repos may sign in |
+| Deploy service account | `orient-deployer` | `run.admin`, `artifactregistry.writer`, may act as the runtime account only |
+| Runtime service account | `orient-orchestrator` | `secretmanager.secretAccessor` and `logging.logWriter` on the project |
+| Artifact Registry | `orient` (Docker, `europe-west1`) | |
+| Secret | `ELEVENLABS_API_KEY` | The ElevenLabs key. Created from `.env` |
+
+The developer account has `roles/editor`. It can create secrets and versions, but cannot read secret values or change IAM. Granting this repo access to `orient-deployer` (the provider condition and a `workloadIdentityUser` binding) needs a project owner; the commands are in the README section "Staging on Cloud Run". Rotate the ElevenLabs key by adding a version, which staging picks up as `latest` on its next release:
+
+```bash
+set -a; source .env; set +a
+printf '%s' "$ELEVENLABS_API_KEY" | gcloud secrets versions add ELEVENLABS_API_KEY --data-file=- --project tungsten-united
+```
+
+**GitHub environment `staging`.** Variables only, no secrets (Workload Identity Federation needs no key): `GCP_PROJECT_ID`, `GCP_REGION`, `GCP_WIF_PROVIDER`, `GCP_DEPLOY_SA`, `GCP_RUNTIME_SA`, `ELEVENLABS_SECRET` (the secret's name, `ELEVENLABS_API_KEY`) and `ELEVENLABS_VOICE_ID`. Set them with `gh variable set <NAME> --env staging`. The real key is used only on releases with the fakes box unticked.
+
 ## Architecture
 
 `src/client.rs` holds the state, the API operations (`utterance`, `frames`, `stop`, `retry`, `trace`, the SSE `events` stream) and the worker, with no HTTP framework. `src/pipeline.rs` holds the model calls and pure decision rules, and never touches state. `src/server.rs` (axum, run by `src/main.rs`) only parses requests, calls `client`, and writes responses. Behaviour changes go in `client.rs`. `src/route.json` is a placeholder route until S01 freezes the real one.
