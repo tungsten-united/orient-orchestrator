@@ -3,27 +3,18 @@ name = "orient-orchestrator"
 version = "0.1.0"
 edition = "2024"
 
-[lib]
-# rlib for the native server and tests, cdylib for the Cloudflare Worker (worker-build).
-crate-type = ["cdylib", "rlib"]
-
 [dependencies]
 futures = "0.3.34"
 regex = "1.13.1"
-reqwest = { version = "0.13.5", default-features = false, features = ["json", "multipart"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 uuid = { version = "1.27.0", features = ["v4"] }
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 axum = { version = "0.8.9", features = ["multipart"] }
-reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "multipart", "rustls"] }
 tokio = { version = "1.53.2", features = ["full"] }
 tower-http = { version = "0.7.1", features = ["cors"] }
 
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-uuid = { version = "1.27.0", features = ["js"] }
-worker = "0.8.7"
 
 [dev-dependencies]
 reqwest = { version = "0.13.5", default-features = false, features = ["stream"] }

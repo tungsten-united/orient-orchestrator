@@ -1,7 +1,7 @@
 //! End to end over HTTP and SSE, against the native server (default) or a running deployment.
 //!
 //!   cargo test --test e2e                                  # in-process server, fakes on random ports
-//!   E2E_BASE=http://localhost:8787 cargo test --test e2e   # e.g. `wrangler dev`; fakes on :8101 (nav) and :8102 (stt)
+//!   E2E_BASE=http://localhost:8787 cargo test --test e2e   # fakes on :8101 (nav) and :8102 (stt)
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
