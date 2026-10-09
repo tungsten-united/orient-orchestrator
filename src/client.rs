@@ -16,11 +16,14 @@ use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::pipeline::{self, Command, Destination, Output, Pipeline, Route, Vars, var};
+use crate::pipeline::{self, Audio, Command, Destination, Output, Pipeline, Route, Vars, var};
 
 const AUDIO_TYPES: [&str; 2] = ["audio/webm", "audio/mp4"];
 const NAV_FAILURES_BEFORE_ERROR: u32 = 3;
 const UNAVAILABLE: &str = "Guidance is unavailable. Double tap to try again.";
+const MAX_SPEECH_CHARS: usize = 240;
+// ponytail: speech cache capped by entry count, never evicted. Templates and prompts are a small fixed set.
+const SPEECH_CACHE_ENTRIES: usize = 256;
 
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -82,6 +85,7 @@ pub struct AppState {
     trace_stdout: bool,
     pub debug_page: bool,
     pub commit: Option<String>, // GIT_SHA, set by the deploy
+    speech_cache: Mutex<HashMap<String, bytes::Bytes>>, // text -> complete MP3
 }
 
 pub type App = Arc<AppState>;
@@ -97,6 +101,7 @@ impl AppState {
             trace_stdout: get("TRACE_STDOUT").is_some(),
             debug_page: get("DEBUG_PAGE").is_some(),
             commit: get("GIT_SHA"),
+            speech_cache: Mutex::default(),
         }
     }
 
@@ -637,6 +642,50 @@ pub fn retry(cref: &ClientRef, body: &[u8]) -> ApiResult<Value> {
     );
     c.responses.insert(b.request_id, r.clone());
     Ok(r)
+}
+
+/// Text to speech for anything the phone says. From the cache, or streamed from ElevenLabs and
+/// cached once the stream completes. Any failure is a 503: the phone then uses browser TTS.
+pub async fn speech(app: &App, text: String) -> ApiResult<Audio> {
+    if text.is_empty() || text.chars().count() > MAX_SPEECH_CHARS {
+        return Err(bad_request(format!(
+            "text: 1 to {MAX_SPEECH_CHARS} characters."
+        )));
+    }
+    if let Some(mp3) = app.speech_cache.lock().unwrap().get(&text) {
+        return Ok(futures::stream::iter([Ok(mp3.clone())]).boxed());
+    }
+    let upstream = app.pipeline.speak(&text).await.map_err(|e| {
+        let mut err = api_error(503, "upstream_unavailable", format!("tts: {e}"));
+        err.retryable = true;
+        err
+    })?;
+    let app = app.clone();
+    let stream = futures::stream::unfold(
+        (upstream, Vec::new(), Some(text)),
+        move |(mut upstream, mut mp3, text)| {
+            let app = app.clone();
+            async move {
+                match upstream.next().await {
+                    Some(Ok(chunk)) => {
+                        mp3.extend_from_slice(&chunk);
+                        Some((Ok(chunk), (upstream, mp3, text)))
+                    }
+                    Some(Err(e)) => Some((Err(e), (upstream, mp3, None))), // never cache a broken stream
+                    None => {
+                        let mut cache = app.speech_cache.lock().unwrap();
+                        if let Some(text) = text
+                            && cache.len() < SPEECH_CACHE_ENTRIES
+                        {
+                            cache.insert(text, mp3.into());
+                        }
+                        None
+                    }
+                }
+            }
+        },
+    );
+    Ok(stream.boxed())
 }
 
 pub fn trace(cref: &ClientRef) -> Value {

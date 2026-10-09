@@ -2,6 +2,7 @@
 //! on one port (`BIND`, default 127.0.0.1:8001), because Cloud Run gives each service a single port.
 //!
 //! The fake Scribe treats the audio bytes as the transcript, so the debug page can "speak" by sending text.
+//! Text to speech is not faked: `GET /speech` answers 503 and the phone or debug page uses browser TTS.
 //! The navigation answer is a preset chosen through `POST /control`, which the debug page drives.
 //!
 //!   cargo run --example fakes

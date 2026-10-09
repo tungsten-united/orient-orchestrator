@@ -6,12 +6,17 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use bytes::Bytes;
+use futures::stream::{BoxStream, StreamExt, TryStreamExt};
 use regex::Regex;
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// MP3 bytes as they arrive.
+pub type Audio = BoxStream<'static, Result<Bytes, BoxError>>;
 
 const ACTIONS: [&str; 5] = ["wait", "turn", "continue", "arrived", "stop"];
 const DIRECTIONS: [&str; 3] = ["left", "right", "around"];
@@ -90,6 +95,8 @@ struct ElevenLabs {
     url: String, // ELEVENLABS_URL: the real API, or the fakes
     key: String,
     stt_model: String,
+    tts_model: String,
+    voice_id: String, // no default: picked by the output owner (S06)
     language: String,
 }
 
@@ -194,6 +201,8 @@ impl Pipeline {
                 url: env("ELEVENLABS_URL", ELEVENLABS_URL),
                 key: env("ELEVENLABS_API_KEY", ""),
                 stt_model: env("ELEVENLABS_STT_MODEL", "scribe_v2"),
+                tts_model: env("ELEVENLABS_TTS_MODEL", "eleven_flash_v2_5"),
+                voice_id: env("ELEVENLABS_VOICE_ID", ""),
                 language: env("SPEECH_LANGUAGE", "en"),
             },
             jev_url: env("JEV_URL", "https://api.typesafe.ai/v1/systemone"),
@@ -259,6 +268,27 @@ impl Pipeline {
             .json()
             .await?;
         Ok(r["text"].as_str().ok_or("no text")?.to_string())
+    }
+
+    /// ElevenLabs Flash, streamed. Fails if the stream has not started within 3 s.
+    pub async fn speak(&self, text: &str) -> Result<Audio, BoxError> {
+        let e = &self.eleven;
+        if e.voice_id.is_empty() {
+            return Err("ELEVENLABS_VOICE_ID is not set".into());
+        }
+        let request = self
+            .http
+            .post(format!(
+                "{}/v1/text-to-speech/{}/stream?output_format=mp3_44100_64",
+                e.url, e.voice_id
+            ))
+            .header("xi-api-key", &e.key)
+            .json(&json!({"text": text, "model_id": e.tts_model, "language_code": e.language}))
+            .send();
+        let r = tokio::time::timeout(Duration::from_secs(3), request)
+            .await??
+            .error_for_status()?;
+        Ok(r.bytes_stream().map_err(BoxError::from).boxed())
     }
 
     pub async fn command(

@@ -135,6 +135,12 @@ let autoTimer = null;
 const view = { phase: null, sessionId: null, destinationId: null, routeStepId: null };
 
 const api = (p) => `/v1/clients/${C.clientId}/${p}`;
+// Like the phone: ElevenLabs through GET /speech, browser TTS if that fails (contracts.md).
+const player = new Audio();
+function say(text) {
+  player.src = api('speech') + '?token=' + encodeURIComponent(C.token) + '&text=' + encodeURIComponent(text);
+  player.play().catch(() => speechSynthesis.speak(new SpeechSynthesisUtterance(text)));
+}
 const serverNow = () => Date.now() + C.offset;
 const short = (id) => (id ? id.slice(0, 4) : '–');
 const clock = (ms) => ((ms - C.t0) / 1000).toFixed(1).padStart(6, ' ') + 's';
@@ -196,7 +202,7 @@ function onEvent(e) {
     for (const k of ['phase', 'sessionId', 'destinationId', 'routeStepId']) if (k in e) view[k] = e[k];
     if (e.type === 'guidance') view.routeStepId = e.nextRouteStepId;
     if (e.type === 'stop' || e.type === 'error') view.phase = 'stopped';
-    if (e.type === 'guidance' && $('#speak').checked) speechSynthesis.speak(new SpeechSynthesisUtterance(e.text));
+    if (e.type === 'guidance' && $('#speak').checked) say(e.text);
   }
   addEvent(e, ignored);
   renderStatus();

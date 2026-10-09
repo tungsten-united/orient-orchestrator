@@ -109,6 +109,22 @@ async fn events(
         .into_response())
 }
 
+/// Token in the query, like the event stream, so the phone can use it as an `<audio>` src.
+async fn speech(
+    State(srv): State<Srv>,
+    Path(id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult<Response> {
+    get_client(&srv, &id, q.get("token").map_or("", String::as_str))?;
+    let text = q.get("text").cloned().unwrap_or_default();
+    let audio = client::speech(&srv.app, text).await?;
+    Ok((
+        [(header::CONTENT_TYPE, "audio/mpeg")],
+        Body::from_stream(audio),
+    )
+        .into_response())
+}
+
 async fn utterance(
     State(srv): State<Srv>,
     Path(id): Path<String>,
@@ -192,6 +208,7 @@ pub fn router(app: App) -> Router {
         .route("/v1/health", get(health))
         .route("/v1/clients", post(create_client))
         .route("/v1/clients/{id}/events", get(events))
+        .route("/v1/clients/{id}/speech", get(speech))
         .route("/v1/clients/{id}/utterances", post(utterance))
         .route("/v1/clients/{id}/frames", post(frames))
         .route("/v1/clients/{id}/stop", post(stop))

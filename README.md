@@ -29,7 +29,7 @@ ELEVENLABS_URL=http://localhost:8001 DEBUG_PAGE=1 TRACE_PATH=trace.jsonl cargo r
 open http://localhost:8000/debug
 ```
 
-The page drives the real API. You can start a client, "say" a destination (the fake speech-to-text turns the audio bytes back into text), send frames by hand or on a timer, choose what the fake navigation engine answers, and press Stop or Retry. Next to the controls it shows the live events, coloured per session, with generation changes and ignored late events. It also shows the run trace, so you can see which outputs were spoken, which were kept quiet, and which were dropped. `/debug` exists only when `DEBUG_PAGE` is set.
+The page drives the real API. With "Speak guidance aloud" it plays guidance through `GET /speech` like the phone, falling back to browser TTS (always, with the fakes, which don't fake text to speech). You can start a client, "say" a destination (the fake speech-to-text turns the audio bytes back into text), send frames by hand or on a timer, choose what the fake navigation engine answers, and press Stop or Retry. Next to the controls it shows the live events, coloured per session, with generation changes and ignored late events. It also shows the run trace, so you can see which outputs were spoken, which were kept quiet, and which were dropped. `/debug` exists only when `DEBUG_PAGE` is set.
 
 ## Staging on Cloud Run
 
@@ -76,6 +76,7 @@ Then, in GitHub, create the environment `staging` (Settings > Environments) with
 | `GCP_RUNTIME_SA` | service account the services run as. The deploy account needs `roles/iam.serviceAccountUser` on it |
 | `NAV_URL` | optional: the real navigation model, for releases without fakes |
 | `ELEVENLABS_SECRET` | optional: name of a Secret Manager secret holding the ElevenLabs key, for releases without fakes |
+| `ELEVENLABS_VOICE_ID` | optional: the ElevenLabs voice for `GET /speech` |
 | `ALLOW_ORIGINS` | optional: the web app's staging origin (default `*`) |
 | `TYPESAFE_SECRET` | optional: name of a Secret Manager secret holding the TypeSafe key. Grant the Cloud Run runtime service account `roles/secretmanager.secretAccessor` on it |
 
@@ -110,7 +111,9 @@ To require approval before each release, add required reviewers to the `staging`
 | `ELEVENLABS_API_KEY` | empty | ElevenLabs key (`xi-api-key`). Server only. Required unless `ELEVENLABS_URL` points at fakes: utterances return 503 without it |
 | `ELEVENLABS_URL` | `https://api.elevenlabs.io` | ElevenLabs base URL. Point it at `examples/fakes.rs` for local runs and staging |
 | `ELEVENLABS_STT_MODEL` | `scribe_v2` | Speech-to-text model |
-| `SPEECH_LANGUAGE` | `en` | Sent to ElevenLabs, so Scribe skips language detection |
+| `ELEVENLABS_TTS_MODEL` | `eleven_flash_v2_5` | Text-to-speech model, the lowest latency |
+| `ELEVENLABS_VOICE_ID` | unset | Voice for `GET /speech`, picked in S06. Unset: `GET /speech` answers 503 and the phone uses browser TTS |
+| `SPEECH_LANGUAGE` | `en` | Sent to ElevenLabs for both directions, so Scribe skips language detection |
 | `NAV_FRAMES` | `5` | Frames per navigation call |
 | `ROUTE_PATH` | built-in `src/route.json` | Route definition |
 | `MAX_INPUT_AGE_MS` | `3000` | Reject older input |
@@ -143,6 +146,7 @@ To require approval before each release, add required reviewers to the `staging`
 ## Known limits
 
 - The Jev call has not been run against the live API yet. The request and answer shapes come from the TypeSafe quickstart, and the parsing is unit-tested against them.
+- The ElevenLabs calls (Scribe and Flash) have not been run against the live API yet. Their shapes come from contracts.md section 4 and are tested against fakes only. The 3 s first-byte timeout of `GET /speech` is not covered by a test.
 - 429 and 529 from TypeSafe are not retried. With a 3 s budget, the user is asked again instead.
 - The first navigation calls of a session carry fewer than 5 frames.
 - Sessions live in memory in one process and never expire.

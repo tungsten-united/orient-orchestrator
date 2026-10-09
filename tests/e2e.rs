@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::extract::Multipart;
+use axum::extract::{Multipart, Path, Query};
 use axum::http::HeaderMap;
 use axum::routing::post;
 use axum::{Json, Router};
@@ -31,6 +31,8 @@ struct FakeNav {
 #[derive(Default)]
 struct FakeEleven {
     stt_request: Value,
+    tts_request: Value,
+    tts_calls: usize,
 }
 
 struct Harness {
@@ -95,6 +97,30 @@ async fn harness() -> Harness {
             }
         }),
     );
+    // Fake ElevenLabs Flash: the "MP3" is the text, and the text "fail" fails.
+    let fake = eleven.clone();
+    let fake_eleven = fake_eleven.route(
+        "/v1/text-to-speech/{voice}/stream",
+        post(
+            move |Path(voice): Path<String>,
+                  Query(q): Query<std::collections::HashMap<String, String>>,
+                  Json(body): Json<Value>| {
+                let fake = fake.clone();
+                async move {
+                    let mut f = fake.lock().unwrap();
+                    f.tts_calls += 1;
+                    f.tts_request = json!({"voice": voice, "outputFormat": q.get("output_format"), "body": body});
+                    if body["text"] == "fail" {
+                        return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+                    }
+                    Ok((
+                        [(axum::http::header::CONTENT_TYPE, "audio/mpeg")],
+                        format!("mp3:{}", body["text"].as_str().unwrap()),
+                    ))
+                }
+            },
+        ),
+    );
     let base = match std::env::var("E2E_BASE") {
         Ok(base) => {
             serve(fake_vla, 8101).await;
@@ -106,6 +132,7 @@ async fn harness() -> Harness {
                 ("NAV_URL", serve(fake_vla, 0).await),
                 ("ELEVENLABS_URL", serve(fake_eleven, 0).await),
                 ("ELEVENLABS_API_KEY", "test-key".into()),
+                ("ELEVENLABS_VOICE_ID", "test-voice".into()),
             ];
             let get = |k: &str| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone());
             let route: Route = serde_json::from_str(include_str!("../src/route.json")).unwrap();
@@ -500,4 +527,92 @@ async fn should_report_deployed_commit_in_health() {
         .await
         .unwrap();
     assert_eq!(h["commit"], "abc123");
+}
+
+#[tokio::test]
+async fn should_stream_speech_from_elevenlabs_and_cache_it_by_text() {
+    let h = harness().await;
+    let c: Value = h
+        .http
+        .post(format!("{}/v1/clients", h.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let (cid, token) = (
+        c["clientId"].as_str().unwrap(),
+        c["clientToken"].as_str().unwrap(),
+    );
+    let speech = |token: &str, text: &str| {
+        h.http
+            .get(format!("{}/v1/clients/{cid}/speech", h.base))
+            .query(&[("token", token), ("text", text)])
+            .send()
+    };
+    let calls = || h.eleven.lock().unwrap().tts_calls;
+
+    assert_eq!(speech("wrong", "Turn left.").await.unwrap().status(), 401);
+    assert_eq!(speech(token, "").await.unwrap().status(), 400);
+    assert_eq!(speech(token, &"a".repeat(241)).await.unwrap().status(), 400);
+    assert_eq!(calls(), 0);
+
+    // First time: streamed from Flash with the contract's request (contracts.md section 4).
+    let r = speech(token, "Turn left.").await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["content-type"], "audio/mpeg");
+    assert_eq!(r.text().await.unwrap(), "mp3:Turn left.");
+    let mut tts = h.eleven.lock().unwrap().tts_request.clone();
+    if std::env::var("E2E_BASE").is_ok() {
+        tts.as_object_mut().unwrap().remove("voice"); // picked by the deployment
+    } else {
+        assert_eq!(tts["voice"], "test-voice");
+        tts.as_object_mut().unwrap().remove("voice");
+    }
+    assert_eq!(
+        tts,
+        json!({"outputFormat": "mp3_44100_64", "body": {"text": "Turn left.", "model_id": "eleven_flash_v2_5", "language_code": "en"}})
+    );
+    assert_eq!(calls(), 1);
+
+    // Same text again: from the cache, no ElevenLabs call.
+    let r = speech(token, "Turn left.").await.unwrap();
+    assert_eq!(r.text().await.unwrap(), "mp3:Turn left.");
+    assert_eq!(calls(), 1);
+
+    // A failure is a 503 the phone answers with browser TTS, and it is not cached.
+    let r = speech(token, "fail").await.unwrap();
+    assert_eq!(r.status(), 503);
+    let e: Value = r.json().await.unwrap();
+    assert_eq!(e["error"]["code"], "upstream_unavailable");
+    assert_eq!(speech(token, "fail").await.unwrap().status(), 503);
+    assert_eq!(calls(), 3);
+}
+
+#[tokio::test]
+async fn should_answer_503_for_speech_when_no_voice_is_configured() {
+    let base = local_server(&[("ELEVENLABS_API_KEY", "k")]).await;
+    let http = reqwest::Client::new();
+    let c: Value = http
+        .post(format!("{base}/v1/clients"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let r = http
+        .get(format!(
+            "{base}/v1/clients/{}/speech",
+            c["clientId"].as_str().unwrap()
+        ))
+        .query(&[
+            ("token", c["clientToken"].as_str().unwrap()),
+            ("text", "Turn left."),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 503);
 }
