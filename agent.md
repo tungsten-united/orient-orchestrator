@@ -14,12 +14,20 @@ cargo test                                  # unit tests + one end-to-end test
 cargo test validate_only                    # tests whose name matches
 cargo test --test e2e                       # just the end-to-end test (HTTP + SSE)
 cargo clippy --all-targets && cargo fmt     # keep both clean
-cargo run --example fakes                   # fake STT + VLA; with DEBUG_PAGE=1 see /debug (README)
+cargo run --example fakes                   # fake STT + VLA on :8001; with DEBUG_PAGE=1 see /debug (README)
 ```
+
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, clippy with `-D warnings`, and `cargo test` on every push and PR. Keep all three green.
 
 The end-to-end test also runs against a deployment: `E2E_BASE=https://... cargo test --test e2e`. The fakes then bind :8101 (navigation) and :8102 (STT), so point the deployment's `NAV_URL` and `STT_URL` there.
 
 Without `TYPESAFE_API_KEY`, the command step falls back to keyword matching on the route aliases. `STT_URL` is required: utterances return 503 without it. The end-to-end test starts fake STT and navigation servers on random ports, so it needs no network.
+
+## Navigation model and deployment
+
+**The navigation model (VLA) runs on a self-hosted server, not on Google Cloud.** The orchestrator reaches it over the internet at `NAV_URL` (`POST /v1/navigate`), so that URL must be public and reachable from Cloud Run. Each call uploads up to `NAV_FRAMES` frames, which makes it the main source of network egress cost and latency: the call has a 4 s timeout (`pipeline.rs`), and three failures in a row end guidance with an error. Do not assume the model shares a network, region or credentials with the orchestrator, and don't move work to it without asking. STT is a separate service (`STT_URL`).
+
+**Staging runs on Cloud Run and is released by hand only** (`.github/workflows/deploy-staging.yml`, `workflow_dispatch`). Never add an automatic deploy. One image (`Dockerfile`) holds the server and the fakes (`examples/fakes.rs`, `--command fakes`). Staging uses either the fakes or the real `NAV_URL` and `STT_URL`, chosen per release. Because clients live in memory, the server service must keep `--max-instances 1`, `--no-cpu-throttling` (the worker runs between requests) and a long `--timeout` (SSE). The debug page (`DEBUG_PAGE`) is on in staging; its fake navigation URL defaults to the server's `NAV_URL`. Setup: README.md, "Staging on Cloud Run".
 
 ## Architecture
 
