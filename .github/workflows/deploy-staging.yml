@@ -27,6 +27,7 @@ jobs:
       id-token: write
     env:
       REGION: ${{ vars.GCP_REGION }}
+      RUNTIME_SA: ${{ vars.GCP_RUNTIME_SA }}
       IMAGE: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/orient/orient-orchestrator:${{ github.sha }}
       # Optional: name of a Secret Manager secret holding the TypeSafe key.
       SECRETS: ${{ vars.TYPESAFE_SECRET && format('--set-secrets=TYPESAFE_API_KEY={0}:latest', vars.TYPESAFE_SECRET) || '' }}
@@ -37,9 +38,10 @@ jobs:
           GCP_REGION: ${{ vars.GCP_REGION }}
           GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
           GCP_DEPLOY_SA: ${{ vars.GCP_DEPLOY_SA }}
+          GCP_RUNTIME_SA: ${{ vars.GCP_RUNTIME_SA }}
         run: |
           missing=""
-          for v in GCP_PROJECT_ID GCP_REGION GCP_WIF_PROVIDER GCP_DEPLOY_SA; do [ -n "${!v}" ] || missing="$missing $v"; done
+          for v in GCP_PROJECT_ID GCP_REGION GCP_WIF_PROVIDER GCP_DEPLOY_SA GCP_RUNTIME_SA; do [ -n "${!v}" ] || missing="$missing $v"; done
           if [ -n "$missing" ]; then
             echo "::error::Missing variables in the 'staging' environment:$missing (Settings > Environments > staging > Variables, not Secrets). See README.md, Staging on Cloud Run."
             exit 1
@@ -65,7 +67,7 @@ jobs:
         run: |
           # One instance: the navigation preset lives in memory.
           gcloud run deploy orient-fakes-staging --image "$IMAGE" --region "$REGION" --command fakes \
-            --allow-unauthenticated --max-instances 1 --quiet
+            --service-account "$RUNTIME_SA" --allow-unauthenticated --max-instances 1 --quiet
           echo "FAKES_URL=$(gcloud run services describe orient-fakes-staging --region "$REGION" --format 'value(status.url)')" >> "$GITHUB_ENV"
 
       - name: Deploy orchestrator
@@ -79,7 +81,7 @@ jobs:
           # Clients live in memory: one instance, CPU kept between requests for the frame worker,
           # and a long timeout so the SSE stream is not cut.
           gcloud run deploy orient-orchestrator-staging --image "$IMAGE" --region "$REGION" \
-            --allow-unauthenticated --max-instances 1 --min-instances 0 --no-cpu-throttling --timeout 3600 \
+            --service-account "$RUNTIME_SA" --allow-unauthenticated --max-instances 1 --min-instances 0 --no-cpu-throttling --timeout 3600 \
             --set-env-vars "^@^NAV_URL=$NAV_URL@STT_URL=$STT_URL@DEBUG_PAGE=1@GIT_SHA=$GITHUB_SHA@ALLOW_ORIGINS=$ALLOW_ORIGINS" \
             $SECRETS --quiet
 

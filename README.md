@@ -73,6 +73,7 @@ Then, in GitHub, create the environment `staging` (Settings > Environments) with
 | `GCP_PROJECT_ID`, `GCP_REGION` | as above |
 | `GCP_WIF_PROVIDER` | printed by the last command |
 | `GCP_DEPLOY_SA` | `github-deploy@<project>.iam.gserviceaccount.com` |
+| `GCP_RUNTIME_SA` | service account the services run as. The deploy account needs `roles/iam.serviceAccountUser` on it |
 | `NAV_URL`, `STT_URL` | optional: the real models, for releases without fakes |
 | `ALLOW_ORIGINS` | optional: the web app's staging origin (default `*`) |
 | `TYPESAFE_SECRET` | optional: name of a Secret Manager secret holding the TypeSafe key. Grant the Cloud Run runtime service account `roles/secretmanager.secretAccessor` on it |
