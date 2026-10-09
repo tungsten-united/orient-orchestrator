@@ -1,0 +1,19 @@
+name = "orient-orchestrator"
+main = "build/worker/shim.mjs"
+compatibility_date = "2025-09-01"
+
+[build]
+command = "cargo install -q worker-build --version 0.8.7 && worker-build --release"
+
+# One Durable Object per phone client. SQLite-backed classes work on the Workers free plan.
+[[durable_objects.bindings]]
+name = "CLIENTS"
+class_name = "ClientObject"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ClientObject"]
+
+# Settings from README.md go here (NAV_URL, STT_URL, ...). TYPESAFE_API_KEY is a secret:
+#   wrangler secret put TYPESAFE_API_KEY
+[vars]

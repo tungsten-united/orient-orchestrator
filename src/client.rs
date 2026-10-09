@@ -22,6 +22,7 @@ const AUDIO_TYPES: [&str; 2] = ["audio/webm", "audio/mp4"];
 const NAV_FAILURES_BEFORE_ERROR: u32 = 3;
 const UNAVAILABLE: &str = "Guidance is unavailable. Double tap to try again.";
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -29,12 +30,29 @@ pub fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+#[cfg(target_arch = "wasm32")]
+pub fn now_ms() -> i64 {
+    worker::Date::now().as_millis() as i64
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
     tokio::spawn(fut);
 }
 
+#[cfg(target_arch = "wasm32")]
+fn spawn(fut: impl Future<Output = ()> + 'static) {
+    worker::wasm_bindgen_futures::spawn_local(fut);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 async fn sleep(d: Duration) {
     tokio::time::sleep(d).await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn sleep(d: Duration) {
+    worker::Delay::from(d).await
 }
 
 /// Shallow merge of two JSON objects; `extra` wins.

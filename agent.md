@@ -15,21 +15,27 @@ cargo test validate_only                    # tests whose name matches
 cargo test --test e2e                       # just the end-to-end test (HTTP + SSE)
 cargo clippy --all-targets && cargo fmt     # keep both clean
 cargo run --example fakes                   # fake STT + VLA; with DEBUG_PAGE=1 see /debug (README)
+cargo clippy --lib --target wasm32-unknown-unknown  # the Cloudflare build must stay clean too
 ```
 
-The end-to-end test also runs against a deployment: `E2E_BASE=https://... cargo test --test e2e`. The fakes then bind :8101 (navigation) and :8102 (STT), so point the deployment's `NAV_URL` and `STT_URL` there.
+The end-to-end test also runs against a deployment. Against a local Worker:
+
+```bash
+wrangler dev --port 8787 --var NAV_URL:http://127.0.0.1:8101 --var STT_URL:http://127.0.0.1:8102/stt
+E2E_BASE=http://localhost:8787 cargo test --test e2e   # fakes bind :8101 and :8102
+```
 
 Without `TYPESAFE_API_KEY`, the command step falls back to keyword matching on the route aliases. `STT_URL` is required: utterances return 503 without it. The end-to-end test starts fake STT and navigation servers on random ports, so it needs no network.
 
 ## Architecture
 
-`src/client.rs` holds the state, the API operations (`utterance`, `frames`, `stop`, `retry`, `trace`, the SSE `events` stream) and the worker, with no HTTP framework. `src/pipeline.rs` holds the model calls and pure decision rules, and never touches state. `src/server.rs` (axum, run by `src/main.rs`) only parses requests, calls `client`, and writes responses. Behaviour changes go in `client.rs`. `src/route.json` is a placeholder route until S01 freezes the real one.
+One library, two hosts. `src/client.rs` holds the state, the API operations (`utterance`, `frames`, `stop`, `retry`, `trace`, the SSE `events` stream) and the worker, with no HTTP framework. `src/pipeline.rs` holds the model calls and pure decision rules, and never touches state. The hosts only parse requests, call `client`, and write responses: `src/server.rs` (axum, native, run by `src/main.rs`) and `src/cloudflare.rs` (a Worker that sends each `/v1/clients/{id}/*` request to one Durable Object per client, compiled only for `wasm32`). Behaviour changes go in `client.rs` so both hosts get them. The few platform differences (clock, `spawn`, `sleep`) are `cfg(target_arch = "wasm32")` functions at the top of `client.rs`. `src/route.json` is a placeholder route until S01 freezes the real one.
 
 **Two levels of state.** A `Client` is one phone from Start to Stop. It owns the token, the open SSE streams (`Events`), and the `generation`. A `Session` is one spoken action (one destination). It owns the route step, a buffer of the last `NAV_FRAMES` (5) frames, and the previous navigation output. When speech-to-text plus Jev yields a different destination, `start_session` replaces the session. The same destination keeps it.
 
 **`generation` is the stale-result guard.** `Client::reset` increments it. In-flight model calls are not aborted: they finish and their results are dropped. Stop, retry, errors and every new session call it, so the first session already runs at generation 2. Every async step snapshots the generation before awaiting a model and re-checks it after. If it changed, the result is logged as `dropped` and never emitted. Keep this pattern in any new async path.
 
-**Locking.** Each client is an `Arc<std::sync::Mutex<Client>>`. Never hold the guard across an `.await`: snapshot what you need, release, await, then re-lock and re-check the generation.
+**Locking.** Each client is an `Arc<std::sync::Mutex<Client>>`, also in the single-threaded Durable Object. Never hold the guard across an `.await`: snapshot what you need, release, await, then re-lock and re-check the generation.
 
 **Flow:**
 
@@ -42,4 +48,4 @@ Without `TYPESAFE_API_KEY`, the command step falls back to keyword matching on t
 
 **Idempotency and ordering:** responses are cached by `requestId`. `sequence` must increase per client. Input older than `maxInputAgeMs` is rejected. Stop and retry accept any generation.
 
-Deliberate shortcuts are marked with `ponytail:` comments: in-memory clients, a generic STT endpoint. Known limits are listed in README.md.
+Deliberate shortcuts are marked with `ponytail:` comments: in-memory clients (also in the Durable Object), a generic STT endpoint. Known limits are listed in README.md.

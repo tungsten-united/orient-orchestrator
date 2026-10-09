@@ -31,6 +31,18 @@ open http://localhost:8000/debug
 
 The page drives the real API. You can start a client, "say" a destination (the fake speech-to-text turns the audio bytes back into text), send frames by hand or on a timer, choose what the fake navigation engine answers, and press Stop or Retry. Next to the controls it shows the live events, coloured per session, with generation changes and ignored late events. It also shows the run trace, so you can see which outputs were spoken, which were kept quiet, and which were dropped. `/debug` exists only when `DEBUG_PAGE` is set.
 
+## Deploy to Cloudflare
+
+The same API runs as a Worker with one Durable Object per client. SQLite-backed Durable Objects work on the free plan.
+
+```bash
+npx wrangler login
+npx wrangler secret put TYPESAFE_API_KEY   # optional
+npx wrangler deploy --var NAV_URL:https://your-vla --var STT_URL:https://your-stt/stt
+```
+
+Or put the settings from the table below in `[vars]` in `wrangler.toml`. `NAV_URL` and `STT_URL` must be reachable from the internet. `wrangler dev` runs it locally on :8787.
+
 ## Configuration
 
 | Env var | Default | Purpose |
@@ -54,8 +66,9 @@ The page drives the real API. You can start a client, "say" a destination (the f
 
 ## Layout
 
-- `src/client.rs`: clients and sessions, the API operations, SSE events, and the worker.
-- `src/server.rs`, `src/main.rs`: axum HTTP server.
+- `src/client.rs`: clients and sessions, the API operations, SSE events, and the worker. Shared by both hosts.
+- `src/server.rs`, `src/main.rs`: native axum server.
+- `src/cloudflare.rs`, `wrangler.toml`: Cloudflare Worker plus one Durable Object per client.
 - `tests/e2e.rs`: end-to-end test over HTTP and SSE, against the native server or any deployment (`E2E_BASE`).
 - `src/pipeline.rs`: model calls (STT, Jev, VLA), route validation, the worker's comparison rule, and sentence templates.
 - `src/route.json`: placeholder Itnig route. Replace it once S01 freezes the real route.
@@ -74,6 +87,7 @@ The page drives the real API. You can start a client, "say" a destination (the f
 - 429 and 529 from TypeSafe are not retried. With a 3 s budget, the user is asked again instead.
 - STT is any HTTP service returning `{"transcript": ...}` (open point 1).
 - The first navigation calls of a session carry fewer than 5 frames.
-- Sessions live in memory in one process and never expire.
+- Sessions live in memory in one process and never expire. On Cloudflare each client lives in its own Durable Object's memory; if Cloudflare evicts it (no open event stream for a while, or a deploy), the phone gets 404 and must start a new client.
+- On Cloudflare, `ROUTE_PATH`, `TRACE_PATH` and `DEBUG_PAGE` are not available: the route is the built-in one and the trace is only served by `GET .../trace`.
 - The server checks audio and frame sizes in bytes only. The phone enforces `maxAudioMs` and `maxFrameEdgePx`.
 - No rate limiting (`429`) yet.

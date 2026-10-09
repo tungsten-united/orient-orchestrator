@@ -1,3 +1,5 @@
 /target
 *.jsonl
 .env
+/build
+/.wrangler
