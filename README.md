@@ -31,6 +31,54 @@ open http://localhost:8000/debug
 
 The page drives the real API. You can start a client, "say" a destination (the fake speech-to-text turns the audio bytes back into text), send frames by hand or on a timer, choose what the fake navigation engine answers, and press Stop or Retry. Next to the controls it shows the live events, coloured per session, with generation changes and ignored late events. It also shows the run trace, so you can see which outputs were spoken, which were kept quiet, and which were dropped. `/debug` exists only when `DEBUG_PAGE` is set.
 
+## Staging on Cloud Run
+
+Staging is released by hand: **Actions > Deploy staging > Run workflow**, then pick a branch or tag. The workflow runs the CI checks, builds one image (`Dockerfile`: the server, plus the fakes), pushes it to Artifact Registry, and deploys two Cloud Run services:
+
+- `orient-fakes-staging`: the fake navigation engine and STT. Only when the **fakes** box is ticked (the default).
+- `orient-orchestrator-staging`: the server with `DEBUG_PAGE=1`, pointed at the fakes, or at the `NAV_URL` and `STT_URL` of the `staging` environment when the box is unticked. Share `<url>/debug` with the team. `/v1/health` shows the deployed commit.
+
+Both services are public. Anyone with the URL can use the debug page and change the fake answers. Each release drops the clients in memory: connected phones get 404 and start a new client.
+
+The server runs with one instance (clients live in memory), `--no-cpu-throttling` (the frame worker runs between requests) and a 60 min timeout (SSE). It scales to zero when idle, which keeps it within the free tier but loses live clients after about 15 idle minutes.
+
+### One-time setup
+
+```bash
+PROJECT=your-project REGION=europe-west1 REPO=tungsten-united/orient-orchestrator
+gcloud services enable run.googleapis.com artifactregistry.googleapis.com iamcredentials.googleapis.com --project $PROJECT
+gcloud artifacts repositories create orient --repository-format docker --location $REGION --project $PROJECT
+
+# Deploy identity for GitHub Actions, without a stored key (Workload Identity Federation).
+gcloud iam service-accounts create github-deploy --project $PROJECT
+SA=github-deploy@$PROJECT.iam.gserviceaccount.com
+for role in roles/run.admin roles/artifactregistry.writer roles/iam.serviceAccountUser; do
+  gcloud projects add-iam-policy-binding $PROJECT --member serviceAccount:$SA --role $role
+done
+gcloud iam workload-identity-pools create github --location global --project $PROJECT
+gcloud iam workload-identity-pools providers create-oidc github --location global --project $PROJECT \
+  --workload-identity-pool github --issuer-uri https://token.actions.githubusercontent.com \
+  --attribute-mapping google.subject=assertion.sub,attribute.repository=assertion.repository \
+  --attribute-condition "assertion.repository=='$REPO'"
+POOL=$(gcloud iam workload-identity-pools describe github --location global --project $PROJECT --format 'value(name)')
+gcloud iam service-accounts add-iam-policy-binding $SA --project $PROJECT --role roles/iam.workloadIdentityUser \
+  --member "principalSet://iam.googleapis.com/$POOL/attribute.repository/$REPO"
+echo "GCP_WIF_PROVIDER=$POOL/providers/github"
+```
+
+Then, in GitHub, create the environment `staging` (Settings > Environments) with these variables:
+
+| Variable | Value |
+| --- | --- |
+| `GCP_PROJECT_ID`, `GCP_REGION` | as above |
+| `GCP_WIF_PROVIDER` | printed by the last command |
+| `GCP_DEPLOY_SA` | `github-deploy@<project>.iam.gserviceaccount.com` |
+| `NAV_URL`, `STT_URL` | optional: the real models, for releases without fakes |
+| `ALLOW_ORIGINS` | optional: the web app's staging origin (default `*`) |
+| `TYPESAFE_SECRET` | optional: name of a Secret Manager secret holding the TypeSafe key. Grant the Cloud Run runtime service account `roles/secretmanager.secretAccessor` on it |
+
+To require approval before each release, add required reviewers to the `staging` environment. If your organization blocks public services (`allUsers`), `--allow-unauthenticated` fails; ask an org admin, or put the services behind IAP.
+
 ## Configuration
 
 | Env var | Default | Purpose |
@@ -50,10 +98,13 @@ The page drives the real API. You can start a client, "say" a destination (the f
 | `REPEAT_MS` | `7000` | The worker repeats unchanged guidance after this |
 | `TRACE_PATH` | unset | Also append the run trace as JSON lines to this file |
 | `ALLOW_ORIGINS` | `*` | CORS origins, comma separated |
-| `DEBUG_PAGE` | unset | Serve the local debug page at `/debug` |
+| `DEBUG_PAGE` | unset | Serve the debug page at `/debug` (local runs and staging) |
+| `GIT_SHA` | unset | Commit shown by `/v1/health`; set by the staging deploy |
 
 ## Layout
 
+- `Dockerfile`, `.github/workflows/`: CI checks on every push, and the manual staging release.
+- `examples/fakes.rs`: fake navigation engine and STT, for local runs and staging.
 - `src/client.rs`: clients and sessions, the API operations, SSE events, and the worker.
 - `src/server.rs`, `src/main.rs`: axum HTTP server.
 - `tests/e2e.rs`: end-to-end test over HTTP and SSE, against the native server or any deployment (`E2E_BASE`).
