@@ -23,7 +23,7 @@ use tokio::sync::broadcast;
 use tokio::task::AbortHandle;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
-use pipeline::{Command, Destination, Pipeline, Route, Spoken, WriterInput, env};
+use pipeline::{Command, Destination, Pipeline, Route, Spoken, env};
 
 const AUDIO_TYPES: [&str; 2] = ["audio/webm", "audio/mp4"];
 const NAV_FAILURES_BEFORE_ERROR: u32 = 3;
@@ -852,22 +852,9 @@ async fn process_frame(app: &App, sref: &SessionRef, p: Pending) {
         .pipeline
         .decide(&action, &new_step, uncertain, last.as_ref(), t);
     timings.insert("decide".into(), json!(now_ms() - t));
-    let text = if speak {
-        let t = now_ms();
-        let input = WriterInput {
-            action: action.clone(),
-            direction: direction.clone(),
-            route_step_id: new_step.clone(),
-            destination_label: dest.label.clone(),
-            step_hint: app.hint(&new_step).to_string(),
-            uncertain,
-        };
-        let text = app.pipeline.write(&input).await;
-        timings.insert("write".into(), json!(now_ms() - t));
-        Some(text)
-    } else {
-        None
-    };
+    // Jev answers typed questions but does not generate text, so the writer is a template.
+    let text =
+        speak.then(|| pipeline::template(&action, direction.as_deref(), uncertain, &dest.label));
 
     let mut s = lock(sref);
     if s.generation != started_gen {
@@ -992,7 +979,7 @@ mod tests {
         );
         let mut pipeline = Pipeline::from_env();
         pipeline.nav_url = serve(fake_vla).await;
-        pipeline.jev_base_url = String::new();
+        pipeline.jev_api_key = String::new();
         let app = Arc::new(AppState::new(load_route(), pipeline));
         Harness {
             base: serve(router(app.clone())).await,

@@ -1,4 +1,4 @@
-//! Model calls behind the orchestrator: STT, command, navigation, decider, writer.
+//! Model calls behind the orchestrator: STT, command (TypeSafe Jev), navigation, decider, writer.
 //!
 //! Every model output is validated here. Nothing in this module changes session state.
 
@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use regex::Regex;
 use reqwest::multipart::{Form, Part};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -15,13 +15,6 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 const ACTIONS: [&str; 5] = ["wait", "turn", "continue", "arrived", "stop"];
 const DIRECTIONS: [&str; 3] = ["left", "right", "around"];
 const CANCEL_WORDS: [&str; 3] = ["cancel", "stop", "never mind"];
-const MAX_TEXT: usize = 240;
-
-const COMMAND_PROMPT: &str = "You turn a blind user's spoken request into a navigation command. \
-Reply with JSON only: {\"command\": \"start\" | \"cancel\" | \"unsupported\", \"destinationId\": string | null, \
-\"confidence\": number}. Only use a destinationId from the input list.";
-const WRITER_PROMPT: &str = "You write one short spoken navigation instruction for a blind user, at most 20 words, \
-naming the landmark when it helps. No preamble. Reply with JSON only: {\"text\": string}.";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -75,25 +68,15 @@ pub struct Spoken {
     pub at: i64,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WriterInput {
-    pub action: String,
-    pub direction: Option<String>,
-    pub route_step_id: String,
-    pub destination_label: String,
-    pub step_hint: String,
-    pub uncertain: bool,
-}
-
 pub struct Pipeline {
     http: reqwest::Client,
     pub nav_url: String,
     pub engine: String,
     pub stt_url: String,
-    pub jev_base_url: String,
-    jev_api_key: String,
+    jev_url: String,
+    pub jev_api_key: String,
     jev_model: String,
+    jev_min_confidence: f64,
     pub min_confidence: f64,
     pub repeat_ms: i64,
 }
@@ -107,7 +90,54 @@ fn says(text: &str, phrase: &str) -> bool {
         .is_ok_and(|re| re.is_match(text))
 }
 
-/// Keyword fallback used when no Jev API is configured.
+/// Jev Choice question for the Command step. Option keys are destination IDs plus `cancel` and `unsupported`.
+pub fn command_question(destinations: &[Destination]) -> Value {
+    let mut criteria = serde_json::Map::new();
+    for d in destinations {
+        let examples = d.aliases.join(", ");
+        criteria.insert(
+            d.destination_id.clone(),
+            json!(format!(
+                "Wants to go to the {}, for example: {examples}.",
+                d.label
+            )),
+        );
+    }
+    criteria.insert(
+        "cancel".into(),
+        json!("Wants to stop, cancel or end the guidance."),
+    );
+    criteria.insert(
+        "unsupported".into(),
+        json!("Wants something else: another place, a question, or nothing clear."),
+    );
+    json!({
+        "type": "choice",
+        "instructions": "What is the blind user asking for in this spoken request? \
+    They are being guided indoors and can only be taken to the listed places.",
+        "criteria": criteria,
+    })
+}
+
+/// Low confidence means "ask again", never a guess.
+pub fn parse_command(answer: &Value, destinations: &[Destination], min_confidence: f64) -> Command {
+    if !answer["confidence"]
+        .as_f64()
+        .is_some_and(|c| c >= min_confidence)
+    {
+        return Command::Unclear;
+    }
+    match answer["choice"].as_str() {
+        Some("cancel") => Command::Cancel,
+        Some("unsupported") => Command::Unsupported,
+        Some(id) if destinations.iter().any(|d| d.destination_id == id) => {
+            Command::Start(id.into())
+        }
+        _ => Command::Unclear,
+    }
+}
+
+/// Keyword fallback used when no TypeSafe key is configured.
 pub fn match_command(transcript: &str, destinations: &[Destination]) -> Command {
     let text = transcript.to_lowercase();
     if CANCEL_WORDS.iter().any(|w| says(&text, w)) {
@@ -145,9 +175,12 @@ impl Pipeline {
             nav_url: env("NAV_URL", "http://localhost:8001"),
             engine: env("NAV_ENGINE", "vla"),
             stt_url: env("STT_URL", ""),
-            jev_base_url: env("JEV_BASE_URL", ""),
-            jev_api_key: env("JEV_API_KEY", ""),
-            jev_model: env("JEV_MODEL", ""),
+            jev_url: env("JEV_URL", "https://api.typesafe.ai/v1/systemone"),
+            jev_api_key: env("TYPESAFE_API_KEY", ""),
+            jev_model: env("JEV_MODEL", "jev-latest"),
+            jev_min_confidence: env("JEV_MIN_CONFIDENCE", "0.5")
+                .parse()
+                .expect("JEV_MIN_CONFIDENCE"),
             min_confidence: env("MIN_CONFIDENCE", "0.5")
                 .parse()
                 .expect("MIN_CONFIDENCE"),
@@ -155,20 +188,17 @@ impl Pipeline {
         }
     }
 
-    async fn jev(&self, prompt: &str, payload: Value, timeout_ms: u64) -> Result<Value, BoxError> {
-        // ponytail: assumes an OpenAI-compatible chat completions API with JSON mode.
-        // Jev's wire format isn't documented yet; only this function changes when it is.
-        let body = json!({
-            "model": self.jev_model,
-            "response_format": {"type": "json_object"},
-            "messages": [
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": payload.to_string()},
-            ],
-        });
+    /// One TypeSafe System One call: a state plus typed questions, answers keyed like the questions.
+    async fn jev(
+        &self,
+        state: Value,
+        questions: Value,
+        timeout_ms: u64,
+    ) -> Result<Value, BoxError> {
+        let body = json!({"model": self.jev_model, "state": state, "questions": questions});
         let r: Value = self
             .http
-            .post(format!("{}/chat/completions", self.jev_base_url))
+            .post(&self.jev_url)
             .bearer_auth(&self.jev_api_key)
             .json(&body)
             .timeout(Duration::from_millis(timeout_ms))
@@ -177,18 +207,11 @@ impl Pipeline {
             .error_for_status()?
             .json()
             .await?;
-        let content = r["choices"][0]["message"]["content"]
-            .as_str()
-            .ok_or("no content")?;
-        let out: Value = serde_json::from_str(content)?;
-        if !out.is_object() {
-            return Err("Jev output is not a JSON object".into());
-        }
-        Ok(out)
+        Ok(r["answers"].clone())
     }
 
     pub async fn transcribe(&self, audio: Vec<u8>, content_type: &str) -> Result<String, BoxError> {
-        // ponytail: open point 1. Any HTTP STT that returns {"transcript": ...}; fold into jev() if Jev takes audio.
+        // ponytail: open point 1. Any HTTP STT that returns {"transcript": ...}; Jev only takes text and JSON state.
         let part = Part::bytes(audio)
             .file_name("audio")
             .mime_str(content_type)?;
@@ -211,27 +234,16 @@ impl Pipeline {
         phase: &str,
         destinations: &[Destination],
     ) -> Command {
-        if self.jev_base_url.is_empty() {
+        if self.jev_api_key.is_empty() {
             return match_command(transcript, destinations);
         }
-        let public: Vec<Value> = destinations
-            .iter()
-            .map(|d| json!({"destinationId": d.destination_id, "label": d.label, "aliases": d.aliases}))
-            .collect();
-        let payload = json!({"transcript": transcript, "phase": phase, "destinations": public});
-        let Ok(out) = self.jev(COMMAND_PROMPT, payload, 3000).await else {
-            return Command::Unclear;
-        };
-        match out["command"].as_str() {
-            Some("start") => match out["destinationId"].as_str() {
-                Some(id) if destinations.iter().any(|d| d.destination_id == id) => {
-                    Command::Start(id.into())
-                }
-                _ => Command::Unsupported,
-            },
-            Some("cancel") => Command::Cancel,
-            Some("unsupported") => Command::Unsupported,
-            _ => Command::Unclear,
+        let state = json!({"spokenRequest": transcript, "sessionPhase": phase});
+        let questions = json!({"command": command_question(destinations)});
+        match self.jev(state, questions, 3000).await {
+            Ok(answers) => {
+                parse_command(&answers["command"], destinations, self.jev_min_confidence)
+            }
+            Err(_) => Command::Unclear,
         }
     }
 
@@ -299,7 +311,7 @@ impl Pipeline {
         (action.to_string(), direction, proposed.to_string(), false)
     }
 
-    /// Utterance decider, rules version. Same contract if it moves to the Jev API.
+    /// Utterance decider, rules version. If rules prove too rigid, this is a natural Jev Noul question.
     pub fn decide(
         &self,
         action: &str,
@@ -325,24 +337,6 @@ impl Pipeline {
         } else {
             (false, "unchanged")
         }
-    }
-
-    /// One short sentence. Falls back to a template so guidance never stops because the writer failed.
-    pub async fn write(&self, input: &WriterInput) -> String {
-        if !self.jev_base_url.is_empty()
-            && let Ok(out) = self.jev(WRITER_PROMPT, json!(input), 2000).await
-            && let Some(text) = out["text"].as_str().map(str::trim)
-            && !text.is_empty()
-            && text.chars().count() <= MAX_TEXT
-        {
-            return text.to_string();
-        }
-        template(
-            &input.action,
-            input.direction.as_deref(),
-            input.uncertain,
-            &input.destination_label,
-        )
     }
 }
 
@@ -414,5 +408,33 @@ mod tests {
         );
         assert_eq!(match_command("cancel please", d), Command::Cancel);
         assert_eq!(match_command("barcelona", d), Command::Unsupported);
+    }
+
+    #[test]
+    fn jev_command_is_one_choice_and_low_confidence_asks_again() {
+        let route: Route = serde_json::from_str(include_str!("route.json")).unwrap();
+        let d = &route.destinations;
+        let q = command_question(d);
+        let options: Vec<&String> = q["criteria"].as_object().unwrap().keys().collect();
+        assert_eq!(options, ["bathroom", "cancel", "counter", "unsupported"]);
+        // Answer shape from https://docs.typesafe.ai/introduction/quickstart
+        let answer = |choice: &str, confidence: f64| json!({"type": "choice", "choice": choice, "confidence": confidence, "probabilities": {}});
+        assert_eq!(
+            parse_command(&answer("counter", 0.8), d, 0.5),
+            Command::Start("counter".into())
+        );
+        assert_eq!(
+            parse_command(&answer("cancel", 0.9), d, 0.5),
+            Command::Cancel
+        );
+        assert_eq!(
+            parse_command(&answer("counter", 0.3), d, 0.5),
+            Command::Unclear
+        );
+        assert_eq!(
+            parse_command(&answer("kitchen", 0.9), d, 0.5),
+            Command::Unclear
+        );
+        assert_eq!(parse_command(&json!(null), d, 0.5), Command::Unclear);
     }
 }
