@@ -79,6 +79,7 @@ pub struct AppState {
     pub pipeline: Pipeline,
     pub limits: Limits,
     trace_path: Option<String>,
+    trace_stdout: bool,
     pub debug_page: bool,
     pub commit: Option<String>, // GIT_SHA, set by the deploy
 }
@@ -93,6 +94,7 @@ impl AppState {
             pipeline,
             limits: Limits::from_vars(get),
             trace_path: get("TRACE_PATH"),
+            trace_stdout: get("TRACE_STDOUT").is_some(),
             debug_page: get("DEBUG_PAGE").is_some(),
             commit: get("GIT_SHA"),
         }
@@ -210,6 +212,8 @@ pub struct Client {
     session: Option<Session>,
     entries: Vec<Value>,
     trace_path: Option<String>,
+    trace_stdout: bool,
+    stamp: Value, // which app produced the trace: commit, version, route
 }
 
 pub fn lock(c: &ClientRef) -> MutexGuard<'_, Client> {
@@ -298,8 +302,11 @@ impl Client {
                 "action": null, "confidence": null, "observation": null, "spoke": false,
                 "text": null, "timingsMs": {}, "dropped": null, "error": null,
             }),
-            fields,
+            merge(&self.stamp, fields),
         );
+        if self.trace_stdout {
+            println!("{entry}"); // one JSON line: Cloud Logging stores it as a structured entry
+        }
         if let Some(path) = &self.trace_path
             && let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
@@ -383,6 +390,11 @@ pub fn create_client(app: &App, id: String) -> (ClientRef, Value) {
         session: None,
         entries: Vec::new(),
         trace_path: app.trace_path.clone(),
+        trace_stdout: app.trace_stdout,
+        stamp: json!({
+            "commit": app.commit, "version": env!("CARGO_PKG_VERSION"),
+            "routeId": app.route.route_id,
+        }),
     };
     c.log(None, "client", json!({}));
     let destinations: Vec<Value> = app
@@ -866,6 +878,23 @@ async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
 mod tests {
     use super::*;
     use futures::StreamExt;
+
+    #[test]
+    fn should_stamp_every_trace_entry_with_the_app_version() {
+        let get = |k: &str| (k == "GIT_SHA").then(|| "abc123".to_string());
+        let route: Route = serde_json::from_str(include_str!("route.json")).unwrap();
+        let app = Arc::new(AppState::new(route, Pipeline::from_vars(&get), &get));
+        let (cref, _) = create_client(&app, "c1".into());
+        let entry = &trace(&cref)["entries"][0];
+        assert_eq!(
+            (&entry["commit"], &entry["version"], &entry["routeId"]),
+            (
+                &json!("abc123"),
+                &json!(env!("CARGO_PKG_VERSION")),
+                &json!(app.route.route_id)
+            )
+        );
+    }
 
     #[test]
     fn should_send_to_every_subscriber_and_forget_closed_ones() {
