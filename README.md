@@ -54,7 +54,9 @@ The page drives the real API. You can start a client, "say" a destination (the f
 
 ## Layout
 
-- `src/main.rs`: HTTP API, clients and sessions, SSE, the worker, and the integration test.
+- `src/client.rs`: clients and sessions, the API operations, SSE events, and the worker.
+- `src/server.rs`, `src/main.rs`: axum HTTP server.
+- `tests/e2e.rs`: end-to-end test over HTTP and SSE, against the native server or any deployment (`E2E_BASE`).
 - `src/pipeline.rs`: model calls (STT, Jev, VLA), route validation, the worker's comparison rule, and sentence templates.
 - `src/route.json`: placeholder Itnig route. Replace it once S01 freezes the real route.
 

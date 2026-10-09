@@ -83,8 +83,11 @@ pub struct Pipeline {
     pub repeat_ms: i64,
 }
 
-pub fn env(name: &str, default: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| default.to_string())
+/// Settings lookup: process environment natively, Worker vars and secrets on Cloudflare.
+pub type Vars<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+pub fn var(get: Vars, name: &str, default: &str) -> String {
+    get(name).unwrap_or_else(|| default.to_string())
 }
 
 fn says(text: &str, phrase: &str) -> bool {
@@ -171,7 +174,8 @@ pub fn template(
 }
 
 impl Pipeline {
-    pub fn from_env() -> Self {
+    pub fn from_vars(get: Vars) -> Self {
+        let env = |name, default| var(get, name, default);
         Pipeline {
             http: reqwest::Client::new(),
             nav_url: env("NAV_URL", "http://localhost:8001"),
@@ -355,8 +359,14 @@ mod tests {
     }
 
     #[test]
+    fn should_read_settings_from_the_lookup_when_given() {
+        let p = Pipeline::from_vars(&|k| (k == "NAV_URL").then(|| "http://nav".to_string()));
+        assert_eq!((p.nav_url.as_str(), p.repeat_ms), ("http://nav", 7000));
+    }
+
+    #[test]
     fn validate_only_moves_along_the_route() {
-        let p = Pipeline::from_env();
+        let p = Pipeline::from_vars(&|_| None);
         let ok = json!({"action": "continue", "proposedNextStepId": "corridor", "confidence": 0.9});
         assert_eq!(
             p.validate(&ok, "start", &path()),
@@ -380,7 +390,7 @@ mod tests {
 
     #[test]
     fn speaks_only_when_output_differs_from_previous() {
-        let p = Pipeline::from_env();
+        let p = Pipeline::from_vars(&|_| None);
         let prev = out("turn", Some("left"), "corridor", false);
         assert_eq!(p.should_speak(&prev, None, 0, 1000), (true, "first"));
         assert_eq!(
