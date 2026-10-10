@@ -301,12 +301,13 @@ impl Client {
             &json!({
                 "at": now_ms(), "clientId": self.id,
                 "sessionId": self.session.as_ref().map(|s| &s.id), "generation": self.generation,
-                "requestId": request_id, "kind": kind, "clientRouteStepId": null,
+                "requestId": request_id, "kind": kind, "phase": self.phase(), "clientRouteStepId": null,
                 "routeStepId": self.session.as_ref().and_then(|s| s.node.as_ref()),
                 "destinationId": self.session.as_ref().map(|s| &s.destination.destination_id),
                 "transcript": null, "command": null, "engine": null, "framesSent": null,
                 "action": null, "confidence": null, "observation": null, "spoke": false,
                 "text": null, "timingsMs": {}, "dropped": null, "error": null,
+                "localize": null, "route": null, "quietReason": null,
             }),
             merge(&self.stamp, fields),
         );
@@ -946,7 +947,7 @@ async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
     timings.insert("localize".into(), json!(now_ms() - t));
     base = merge(
         &base,
-        json!({"confidence": found["candidates"][0]["score"], "observation": format!("{}: {}", found["status"].as_str().unwrap_or(""), found["reason"].as_str().unwrap_or(""))}),
+        json!({"confidence": found["candidates"][0]["score"], "observation": format!("{}: {}", found["status"].as_str().unwrap_or(""), found["reason"].as_str().unwrap_or("")), "localize": found}),
     );
     let here = app.pipeline.located(&found).or(node);
     let output = match here.as_deref() {
@@ -957,7 +958,9 @@ async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
             match app.pipeline.path(n, goal).await {
                 Ok(path) => {
                     timings.insert("route".into(), json!(now_ms() - t));
-                    app.pipeline.validate(&path, n)
+                    let output = app.pipeline.validate(&path, n);
+                    base = merge(&base, json!({"route": path}));
+                    output
                 }
                 Err(e) => return nav_failed(cref, started_gen, rid, &base, format!("route: {e}")),
             }
@@ -1032,7 +1035,7 @@ async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
         "frame",
         merge(
             &base,
-            json!({"action": output.action, "spoke": speak, "text": text, "timingsMs": timings}),
+            json!({"action": output.action, "spoke": speak, "text": text, "timingsMs": timings, "quietReason": (!speak).then_some(reason)}),
         ),
     );
 }
@@ -1077,6 +1080,7 @@ mod tests {
                     (&json!("stop"), &json!("stop"))
                 );
                 assert_eq!(ev["requestId"], "r1");
+                assert_eq!(ev["entry"]["phase"], "awaiting_destination");
             }
         }
     }
