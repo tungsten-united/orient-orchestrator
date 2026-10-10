@@ -412,10 +412,11 @@ pub fn client_logs(app: &App, body: &[u8]) -> ApiResult<Vec<Value>> {
     Ok(entries
         .iter()
         .map(|e| {
-            let level = match e.get("level").and_then(Value::as_str) {
-                Some(l @ ("info" | "warn" | "error")) => l,
-                _ => "info",
-            };
+            let level = e
+                .get("level")
+                .and_then(Value::as_str)
+                .filter(|l| ["info", "warn", "error"].contains(l))
+                .unwrap_or("info");
             json!({
                 "kind": "client_log", "source": "web", "level": level,
                 "at": e.get("at").and_then(Value::as_i64), "receivedAt": received_at,
@@ -1039,7 +1040,7 @@ mod tests {
         let body = br#"{"deviceId":"d1","clientId":"c1","entries":[
             {"at":5,"level":"error","event":"permission_denied","detail":"NotAllowedError"},
             {"at":6,"level":"nonsense","event":"x"}]}"#;
-        let out = client_logs(&app, body).unwrap();
+        let out = client_logs(&app, body).ok().unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0]["kind"], "client_log");
         assert_eq!(out[0]["level"], "error");
