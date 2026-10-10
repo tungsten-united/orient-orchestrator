@@ -5,8 +5,12 @@ name: Deploy staging
 on:
   workflow_dispatch:
     inputs:
-      fakes:
-        description: Use the fake navigation engine and ElevenLabs (off = NAV_URL from the staging environment and the real ElevenLabs API)
+      fake_nav:
+        description: Use the fake navigation engine (off = NAV_URL from the staging environment)
+        type: boolean
+        default: true
+      fake_speech:
+        description: Use fake ElevenLabs (off = the real ElevenLabs API)
         type: boolean
         default: true
 
@@ -61,7 +65,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Deploy fakes
-        if: inputs.fakes
+        if: inputs.fake_nav || inputs.fake_speech
         run: |
           # One instance: the navigation preset lives in memory.
           gcloud run deploy orient-fakes-staging --image "$IMAGE" --region "$REGION" --command fakes \
@@ -70,7 +74,8 @@ jobs:
 
       - name: Deploy orchestrator
         env:
-          FAKES: ${{ inputs.fakes }}
+          FAKE_NAV: ${{ inputs.fake_nav }}
+          FAKE_SPEECH: ${{ inputs.fake_speech }}
           REAL_NAV_URL: ${{ vars.NAV_URL }}
           ALLOW_ORIGINS: ${{ vars.ALLOW_ORIGINS || '*' }}
           # Optional: names of Secret Manager secrets holding the keys.
@@ -78,11 +83,10 @@ jobs:
           ELEVENLABS_SECRET: ${{ vars.ELEVENLABS_SECRET }}
           ELEVENLABS_VOICE_ID: ${{ vars.ELEVENLABS_VOICE_ID }}
         run: |
-          if [ "$FAKES" = "true" ]; then
-            NAV_URL="$FAKES_URL"; FAKE_VARS="@ELEVENLABS_URL=$FAKES_URL"
-          else
-            NAV_URL="$REAL_NAV_URL"; FAKE_VARS=""
-          fi
+          NAV_URL="$REAL_NAV_URL"; FAKE_VARS=""
+          if [ "$FAKE_NAV" = "true" ]; then NAV_URL="$FAKES_URL"; fi
+          if [ "$FAKE_SPEECH" = "true" ]; then FAKE_VARS="@ELEVENLABS_URL=$FAKES_URL"; fi
+          if [ -z "$NAV_URL" ]; then echo "::error::fake_nav is off but the staging variable NAV_URL is not set"; exit 1; fi
           SECRETS=""
           if [ -n "$TYPESAFE_SECRET" ]; then SECRETS="TYPESAFE_API_KEY=$TYPESAFE_SECRET:latest"; fi
           if [ -n "$ELEVENLABS_SECRET" ]; then SECRETS="${SECRETS:+$SECRETS,}ELEVENLABS_API_KEY=$ELEVENLABS_SECRET:latest"; fi

@@ -57,6 +57,7 @@ The debug page's Say box sends typed text as fake audio, which only the fakes un
 | Runtime service account | `orient-orchestrator` | `secretmanager.secretAccessor` and `logging.logWriter` on the project |
 | Artifact Registry | `orient` (Docker, `europe-west1`) | |
 | Secret | `ELEVENLABS_API_KEY` | The ElevenLabs key. Created from `.env` |
+| Secret | `typesafe-api-key` | The TypeSafe (Jev) key |
 
 The developer account has `roles/editor`. It can create secrets and versions, but cannot read secret values or change IAM. Granting this repo access to `orient-deployer` (the provider condition and a `workloadIdentityUser` binding) needs a project owner; the commands are in the README section "Staging on Cloud Run". Rotate the ElevenLabs key by adding a version, which staging picks up as `latest` on its next release:
 
@@ -65,7 +66,7 @@ set -a; source .env; set +a
 printf '%s' "$ELEVENLABS_API_KEY" | gcloud secrets versions add ELEVENLABS_API_KEY --data-file=- --project tungsten-united
 ```
 
-**GitHub environment `staging`.** Variables only, no secrets (Workload Identity Federation needs no key): `GCP_PROJECT_ID`, `GCP_REGION`, `GCP_WIF_PROVIDER`, `GCP_DEPLOY_SA`, `GCP_RUNTIME_SA`, `ELEVENLABS_SECRET` (the secret's name, `ELEVENLABS_API_KEY`) and `ELEVENLABS_VOICE_ID`. Set them with `gh variable set <NAME> --env staging`. The real key is used only on releases with the fakes box unticked.
+**GitHub environment `staging`.** Variables only, no secrets (Workload Identity Federation needs no key): `GCP_PROJECT_ID`, `GCP_REGION`, `GCP_WIF_PROVIDER`, `GCP_DEPLOY_SA`, `GCP_RUNTIME_SA`, `ELEVENLABS_SECRET` (the secret's name, `ELEVENLABS_API_KEY`), `ELEVENLABS_VOICE_ID`, `TYPESAFE_SECRET` (`typesafe-api-key`, so Jev runs on every release) and `ALLOW_ORIGINS` (`https://orient.harshdeepsingh.dev`, the web app). Set them with `gh variable set <NAME> --env staging`. The real ElevenLabs key is used only on releases with `fake_speech` unticked; `fake_nav` is separate.
 
 ## Architecture
 
