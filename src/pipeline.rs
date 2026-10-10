@@ -298,17 +298,27 @@ impl Pipeline {
         !self.eleven.key.is_empty() || self.eleven.url != ELEVENLABS_URL
     }
 
-    /// ElevenLabs Scribe, batch: the phone's audio as received, no transcoding.
-    pub async fn transcribe(&self, audio: Vec<u8>, content_type: &str) -> Result<String, BoxError> {
+    /// ElevenLabs Scribe, batch: the phone's audio as received, no transcoding, biased towards the destination names.
+    pub async fn transcribe(
+        &self,
+        audio: Vec<u8>,
+        content_type: &str,
+        destinations: &[Destination],
+    ) -> Result<String, BoxError> {
         let e = &self.eleven;
         let file = Part::bytes(audio)
             .file_name("audio")
             .mime_str(content_type)?;
-        let form = Form::new()
+        let mut form = Form::new()
             .text("model_id", e.stt_model.clone())
             .text("language_code", e.language.clone())
             .text("tag_audio_events", "false")
             .part("file", file);
+        for d in destinations {
+            for term in std::iter::once(&d.label).chain(&d.aliases) {
+                form = form.text("keyterms", term.clone());
+            }
+        }
         let r: Value = self
             .http
             .post(format!("{}/v1/speech-to-text", e.url))

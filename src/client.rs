@@ -800,7 +800,11 @@ async fn handle_input(
     let rid = Some(m.request_id.as_str());
     let mut timings = serde_json::Map::new();
     let t = now_ms();
-    let transcript = match app.pipeline.transcribe(audio, &content_type).await {
+    let transcript = match app
+        .pipeline
+        .transcribe(audio, &content_type, &app.route.destinations)
+        .await
+    {
         Ok(text) => text.trim().to_string(),
         Err(e) => {
             let mut c = lock(&cref);

@@ -135,6 +135,12 @@ async fn harness_with(with_jev: bool) -> Harness {
                     if name == "file" {
                         request["fileType"] = json!(f.content_type());
                         text = String::from_utf8_lossy(&f.bytes().await.unwrap()).into();
+                    } else if name == "keyterms" {
+                        let term = f.text().await.unwrap();
+                        match request[&name].as_array_mut() {
+                            Some(terms) => terms.push(json!(term)),
+                            None => request[name] = json!([term]),
+                        }
                     } else {
                         request[name] = json!(f.text().await.unwrap());
                     }
@@ -406,7 +412,9 @@ async fn sessions_frames_worker_and_stop() {
     stt.as_object_mut().unwrap().remove("key");
     assert_eq!(
         stt,
-        json!({"model_id": "scribe_v2", "language_code": "en", "tag_audio_events": "false", "fileType": "audio/webm"})
+        json!({"model_id": "scribe_v2", "language_code": "en", "tag_audio_events": "false", "fileType": "audio/webm",
+            "keyterms": ["drinks area", "drinks", "drink", "coffee", "water", "bar", "fridge", "kitchen", "kitchen",
+                "stage", "stage", "talks", "talk", "presentation"]})
     );
 
     // Replays, old sequences and old captures are rejected without side effects.
