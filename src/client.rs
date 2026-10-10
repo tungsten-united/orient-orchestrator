@@ -1445,6 +1445,48 @@ mod tests {
         assert!(nav.path.is_none());
     }
 
+    /// The walk back on Glories Basement, 2026-10-10 (tests/fixtures/glories-walk-back.json): the locating rules, run
+    /// over the localize answers nav-api gave live, place the user where the live orchestrator did, frame by frame, and
+    /// in the order walked. Most answers were `lost`: a `lost` result votes when its node leads clearly.
+    #[test]
+    fn should_place_the_user_on_the_live_walk_back_as_the_live_orchestrator_did() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/glories-walk-back.json")).unwrap();
+        let pipeline = Pipeline::from_vars(&|_| None);
+        let mut walked = Vec::new();
+        for s in fixture["sessions"].as_array().unwrap() {
+            let mut nav = Nav::default();
+            for (i, f) in s["frames"].as_array().unwrap().iter().enumerate() {
+                let found = &f["localize"];
+                let confirmed = pipeline.located(found);
+                let (_, _, mv) = advance(
+                    &mut nav,
+                    found,
+                    confirmed,
+                    (None, i as i64),
+                    &pipeline.nav_loop,
+                );
+                let placed = match mv {
+                    Move::Located(n) => Some(n),
+                    _ => None,
+                };
+                assert_eq!(
+                    placed.as_deref(),
+                    f["located"].as_str(),
+                    "session {} frame {i}",
+                    s["client"]
+                );
+                if let Some(n) = placed
+                    && walked.last() != Some(&n)
+                {
+                    walked.push(n);
+                }
+            }
+        }
+        // Bar kiosk, Orange shop, Playground, Body Shop junction, Rituals shop: back towards the entrance.
+        assert_eq!(walked, ["n13", "n10", "n9", "n8", "n5"]);
+    }
+
     #[test]
     fn should_tell_the_phone_its_frame_pace_and_size() {
         let limits = |get: Vars| serde_json::to_value(Limits::from_vars(get)).unwrap();

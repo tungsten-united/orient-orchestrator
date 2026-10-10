@@ -933,6 +933,25 @@ mod tests {
         assert_eq!(fit_instruction(&"a".repeat(241)), None);
     }
 
+    /// Itnig, 2026-10-10 (session 9a90bd61): nav-engine's cleaner joined two hops into one, Drinks area -> Corridor
+    /// end, with this 263-character instruction. The phone said only its first sentence, the user stopped at the
+    /// tables, 4 m short, and the hop never confirmed. nav-engine no longer joins hops and flags any instruction over
+    /// 240 characters; this keeps the phone's side of that contract on record.
+    #[test]
+    fn should_say_only_what_fits_of_the_live_263_character_instruction() {
+        let live = "Bear right slightly and keep down the narrow aisle for about 3 metres until a group of tables is \
+                    on your right. Then, bear right and continue about 4 metres down the aisle until it opens out into \
+                    a wider space; a fire extinguisher hangs on the wall on your right.";
+        assert_eq!(live.chars().count(), 263);
+        assert_eq!(
+            fit_instruction(live).as_deref(),
+            Some(
+                "Bear right slightly and keep down the narrow aisle for about 3 metres until a group of tables \
+                 is on your right."
+            )
+        );
+    }
+
     #[test]
     fn should_say_a_changed_direction_unless_jev_is_sure_it_is_not_worth_it() {
         let answer = |choice: &str, confidence: f64| json!({"type": "choice", "choice": choice, "confidence": confidence});

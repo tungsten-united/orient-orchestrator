@@ -19,6 +19,8 @@ cargo run --example fakes                   # fake STT + navigation on :8001; wi
 
 CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, clippy with `-D warnings`, and `cargo test` on every push and PR. Keep all three green.
 
+A problem found in a live test becomes a test made from its logs, not only a fix. Staging's trace (Cloud Logging, `TRACE_STDOUT`) has every frame's whole nav-api answer and what the orchestrator decided, so a session can be replayed: `tests/fixtures/glories-walk-back.json` is the walk back on Glories Basement (2026-10-10, its `about` says how it was cut from the logs). A unit test runs the navigation loop over those answers and must make the live decisions frame by frame; e2e tests replay sessions through the whole server with a fake nav-api answering as nav-api did.
+
 The end-to-end test also runs against a deployment: `E2E_BASE=https://... cargo test --test e2e`. The fakes then bind :8101 (navigation) and :8102 (ElevenLabs), so point the deployment's `NAV_URL` and `ELEVENLABS_URL` there.
 
 Without `TYPESAFE_API_KEY`, the command step falls back to keyword matching on the places' names. Speech to text is ElevenLabs Scribe (contracts.md section 4): inputs return 503 without `ELEVENLABS_API_KEY`, unless `ELEVENLABS_URL` points at fakes. The end-to-end test starts fake STT and navigation servers on random ports, so it needs no network.
