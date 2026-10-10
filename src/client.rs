@@ -65,6 +65,7 @@ pub struct Limits {
     max_input_age_ms: i64,
     heartbeat_ms: u64,
     nav_frames: usize,
+    frame_gap_ms: u64, // the phone waits this long after each frame upload: the pace of `localize` calls
 }
 
 impl Limits {
@@ -73,12 +74,17 @@ impl Limits {
             max_audio_ms: 10_000,
             max_audio_bytes: 1_000_000,
             max_frame_bytes: 512_000,
-            max_frame_edge_px: 1280,
+            max_frame_edge_px: var(get, "MAX_FRAME_EDGE_PX", "640")
+                .parse()
+                .expect("MAX_FRAME_EDGE_PX"),
             max_input_age_ms: var(get, "MAX_INPUT_AGE_MS", "3000")
                 .parse()
                 .expect("MAX_INPUT_AGE_MS"),
             heartbeat_ms: 5000,
             nav_frames: var(get, "NAV_FRAMES", "4").parse().expect("NAV_FRAMES"),
+            frame_gap_ms: var(get, "FRAME_GAP_MS", "100")
+                .parse()
+                .expect("FRAME_GAP_MS"),
         }
     }
 }
@@ -1407,6 +1413,18 @@ mod tests {
         let (_, _, mv) = advance(&mut nav, &found("uncertain", "n4", 0.05), None, None, &cfg);
         assert_eq!(mv, Move::Reached("n4".into()));
         assert!(nav.path.is_none());
+    }
+
+    #[test]
+    fn should_tell_the_phone_its_frame_pace_and_size() {
+        let limits = |get: Vars| serde_json::to_value(Limits::from_vars(get)).unwrap();
+        let default = limits(&|_| None);
+        assert_eq!(
+            (&default["frameGapMs"], &default["maxFrameEdgePx"]),
+            (&json!(100), &json!(640))
+        );
+        let tuned = limits(&|k| (k == "FRAME_GAP_MS").then(|| "250".to_string()));
+        assert_eq!(tuned["frameGapMs"], 250);
     }
 
     #[test]
