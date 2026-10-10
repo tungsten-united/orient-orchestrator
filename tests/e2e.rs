@@ -27,9 +27,14 @@ struct FakeNav {
     delay_ms: u64,
     frames_seen: usize,
     previous: Option<String>,
+    expected: Option<String>,
     heading: Option<String>,
+    motions: Vec<String>,
+    previous_step_count: Option<String>,
     route_request: Value,
+    route_calls: usize,
     auth: Option<String>,
+    caller: Value, // the X-*-Id headers of the last localize
 }
 
 /// What the fake ElevenLabs received.
@@ -66,20 +71,30 @@ async fn harness_with(with_jev: bool) -> Harness {
         post(move |headers: HeaderMap, mut mp: Multipart| {
             let fake = fake.clone();
             async move {
-                let (mut frames, mut previous, mut heading) = (0, None, None);
+                let (mut frames, mut previous, mut expected, mut heading) = (0, None, None, None);
+                let (mut motions, mut steps) = (Vec::new(), None);
                 while let Some(f) = mp.next_field().await.unwrap() {
                     match f.name() {
                         Some("images") => frames += 1,
                         Some("previous") => previous = Some(f.text().await.unwrap()),
+                        Some("expected") => expected = Some(f.text().await.unwrap()),
                         Some("heading_deg") => heading = Some(f.text().await.unwrap()),
+                        Some("motion") => motions.push(f.text().await.unwrap()),
+                        Some("previous_step_count") => steps = Some(f.text().await.unwrap()),
                         _ => {}
                     }
                 }
+                let header = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).map(String::from);
                 let (answer, delay) = {
                     let mut n = fake.lock().unwrap();
                     n.frames_seen = frames;
                     n.previous = previous;
+                    n.expected = expected;
                     n.heading = heading;
+                    n.motions = motions;
+                    n.previous_step_count = steps;
+                    n.caller = json!({"client": header("x-client-id"), "session": header("x-session-id"),
+                                      "request": header("x-request-id")});
                     n.auth = headers
                         .get("authorization")
                         .and_then(|v| v.to_str().ok())
@@ -99,6 +114,7 @@ async fn harness_with(with_jev: bool) -> Harness {
             async move {
                 let mut n = fake.lock().unwrap();
                 n.route_request = req;
+                n.route_calls += 1;
                 Json(n.route.clone())
             }
         }),
@@ -256,9 +272,48 @@ fn confirmed(node: &str) -> Value {
     json!({"status": "confirmed", "reason": "clear", "best": node, "margin": 0.1, "candidates": [{"node": node, "score": 0.7}]})
 }
 
-fn hop(from: &str, to: &str, step: &str, instruction: Option<&str>) -> Value {
-    json!({"found": true, "hops": [{"edge": "e1", "source": from, "target": to, "instruction": instruction,
-                                     "steps": [{"action": step}], "status": "observed"}]})
+/// A route: (source, target, first step, instruction) per hop.
+fn path(hops: &[(&str, &str, &str, Option<&str>)]) -> Value {
+    let hops: Vec<Value> = hops
+        .iter()
+        .map(|(from, to, step, instruction)| {
+            json!({"edge": "e1", "source": from, "target": to, "instruction": instruction,
+                   "steps": [{"action": step}], "status": "observed"})
+        })
+        .collect();
+    json!({"found": true, "hops": hops})
+}
+
+/// Posts frames from `seq` on until an event other than an unchanged heartbeat arrives (the loop needs a few votes).
+/// Returns it, the next sequence and how many frames it took.
+async fn frames_until_news(
+    h: &Harness,
+    rx: &mut Events,
+    url: &str,
+    token: &str,
+    generation: i64,
+    mut seq: i64,
+) -> (Value, i64, usize) {
+    for sent in 1..=8 {
+        let form = Form::new()
+            .text("meta", meta(&format!("f{seq}"), generation, seq, now_ms()))
+            .part("frame", jpeg());
+        let r = h
+            .http
+            .post(url)
+            .bearer_auth(token)
+            .multipart(form)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 202);
+        seq += 1;
+        let ev = rx.next().await;
+        if !(ev["type"] == "heartbeat" && ev["quietReason"] == "unchanged") {
+            return (ev, seq, sent);
+        }
+    }
+    panic!("nothing new after 8 frames");
 }
 
 fn meta(rid: &str, generation: i64, sequence: i64, captured_at: i64) -> String {
@@ -323,9 +378,9 @@ async fn sessions_frames_worker_and_stop() {
         n.route = route;
         n.delay_ms = delay_ms;
     };
-    let continue_to = |from: &str, to: &str| hop(from, to, "straight", None);
-    let turn_left = |from: &str, to: &str| hop(from, to, "turn_left", None);
     let frames_seen = || h.nav.lock().unwrap().frames_seen;
+    let route_calls = || h.nav.lock().unwrap().route_calls;
+    let local = std::env::var("E2E_BASE").is_err();
 
     // Unknown client: 404. No token: 401, also on the event stream.
     let unknown = format!("{}/v1/clients/nope/trace", h.base);
@@ -367,8 +422,15 @@ async fn sessions_frames_worker_and_stop() {
         .unwrap();
     assert_eq!(r.status(), 400);
 
-    // Audio with the first frame starts session 1.
-    set_nav("start", continue_to("start", "corridor"), 0);
+    // Audio with the first frame starts session 1. A confirmed result locates the user at once; one route.
+    set_nav(
+        "start",
+        path(&[
+            ("start", "corridor", "straight", None),
+            ("corridor", "n2", "turn_left", None),
+        ]),
+        0,
+    );
     let form = Form::new()
         .text("meta", meta("u1", 1, 0, now_ms()))
         .part("audio", audio("take me to the coffee"))
@@ -398,15 +460,21 @@ async fn sessions_frames_worker_and_stop() {
         h.nav.lock().unwrap().route_request,
         json!({"start": "start", "goal": "n2", "trust": "observed"})
     );
-    if std::env::var("E2E_BASE").is_err() {
+    assert_eq!(route_calls(), 1);
+    {
+        let n = h.nav.lock().unwrap();
+        assert_eq!((n.previous.as_deref(), n.expected.as_deref()), (None, None));
         assert_eq!(
-            h.nav.lock().unwrap().auth.as_deref(),
-            Some("Bearer nav-token")
+            n.caller,
+            json!({"client": cid, "session": session1, "request": "u1"})
         );
+        if local {
+            assert_eq!(n.auth.as_deref(), Some("Bearer nav-token"));
+        }
     }
     // Scribe got the phone's audio as is, with the contract's settings (contracts.md section 4).
     let mut stt = h.eleven.lock().unwrap().stt_request.clone();
-    if std::env::var("E2E_BASE").is_err() {
+    if local {
         assert_eq!(stt["key"], "test-key");
     }
     stt.as_object_mut().unwrap().remove("key");
@@ -431,8 +499,9 @@ async fn sessions_frames_worker_and_stop() {
         422
     );
 
-    // Same output as before: the worker stays quiet. The buffer caps at 4 frames.
-    for seq in 2..8 {
+    // Still at the hop's source: the worker stays quiet. Each frame goes to localize once, with its motion, the
+    // hop and the step count from when the user was located.
+    for seq in 2..5 {
         assert_eq!(
             post_frame(&format!("f{seq}"), 2, seq, now_ms())
                 .await
@@ -446,15 +515,25 @@ async fn sessions_frames_worker_and_stop() {
             (Some("heartbeat"), Some("unchanged"))
         );
     }
-    assert_eq!(frames_seen(), 4);
+    {
+        let n = h.nav.lock().unwrap();
+        assert_eq!(n.frames_seen, 1);
+        assert_eq!(
+            (n.previous.as_deref(), n.expected.as_deref()),
+            (Some("start"), Some("corridor"))
+        );
+        assert_eq!(n.motions.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&n.motions[0]).unwrap()["stepCount"],
+            3
+        );
+        assert_eq!(n.previous_step_count.as_deref(), Some("3"));
+        assert_eq!(n.heading.as_deref(), Some("90.5"));
+    }
 
-    // A different output is spoken.
-    set_nav("corridor", turn_left("corridor", "n2"), 0);
-    assert_eq!(
-        post_frame("f8", 2, 8, now_ms()).await.unwrap().status(),
-        202
-    );
-    let ev = rx.next().await;
+    // The hop's target leads in 3 of the last 4: reached, and the next hop is spoken. No new route.
+    set_nav("corridor", h.nav.lock().unwrap().route.clone(), 0);
+    let (ev, seq, took) = frames_until_news(&h, &mut rx, &url("frames"), token, 2, 5).await;
     assert_eq!(
         (
             ev["text"].as_str(),
@@ -463,12 +542,18 @@ async fn sessions_frames_worker_and_stop() {
         ),
         (Some("Turn left."), Some("corridor"), Some("n2"))
     );
-    assert_eq!(h.nav.lock().unwrap().previous.as_deref(), Some("start"));
-    assert_eq!(h.nav.lock().unwrap().heading.as_deref(), Some("90.5"));
+    if local {
+        assert_eq!(took, 3); // NAV_VOTE_K
+    }
+    assert_eq!(route_calls(), 1);
+    assert_eq!(h.nav.lock().unwrap().expected.as_deref(), Some("corridor"));
 
-    // Same action again: same session, same generation.
+    // Same action again: same session, same generation, and the next output is spoken.
     assert_eq!(
-        say("u2", 2, 9, "the coffee please").await.unwrap().status(),
+        say("u2", 2, seq, "the coffee please")
+            .await
+            .unwrap()
+            .status(),
         202
     );
     let ev = rx.next().await;
@@ -477,14 +562,20 @@ async fn sessions_frames_worker_and_stop() {
         (Some(session1.as_str()), Some(2))
     );
     assert_eq!(
-        post_frame("f10", 2, 10, now_ms()).await.unwrap().status(),
+        post_frame("g10", 2, seq + 1, now_ms())
+            .await
+            .unwrap()
+            .status(),
         202
     );
     assert_eq!(rx.next().await["text"], "Turn left.");
+    assert_eq!(h.nav.lock().unwrap().expected.as_deref(), Some("n2"));
 
-    // Different action: new session, new generation, empty buffer and no previous output.
+    // Different action: new session, new generation, empty buffer and no previous output. It locates the user
+    // again, from their last node.
+    h.nav.lock().unwrap().route = path(&[("corridor", "n7", "turn_left", None)]);
     assert_eq!(
-        say("u3", 2, 11, "take me to the kitchen")
+        say("u3", 2, seq + 2, "take me to the kitchen")
             .await
             .unwrap()
             .status(),
@@ -498,21 +589,53 @@ async fn sessions_frames_worker_and_stop() {
         (Some(3), Some("n7"))
     );
     assert_eq!(
-        post_frame("f12", 2, 12, now_ms()).await.unwrap().status(),
+        post_frame("g12", 2, seq + 3, now_ms())
+            .await
+            .unwrap()
+            .status(),
         409
     );
     assert_eq!(
-        post_frame("f14", 3, 14, now_ms()).await.unwrap().status(),
+        post_frame("g14", 3, seq + 4, now_ms())
+            .await
+            .unwrap()
+            .status(),
         202
     );
     assert_eq!(rx.next().await["text"], "Turn left.");
     assert_eq!(frames_seen(), 1);
-    assert_eq!(h.nav.lock().unwrap().route_request["start"], "corridor");
+    {
+        let n = h.nav.lock().unwrap();
+        assert_eq!(
+            (n.previous.as_deref(), n.expected.as_deref()),
+            (Some("corridor"), None)
+        );
+        assert_eq!(n.route_request["start"], "corridor");
+    }
+    assert_eq!(route_calls(), 2);
+
+    // Somewhere else, three times out of four: lost. Locate again, and a new route from there.
+    set_nav("n5", path(&[("n5", "n7", "straight", None)]), 0);
+    let (ev, seq, _) = frames_until_news(&h, &mut rx, &url("frames"), token, 3, seq + 5).await;
+    assert_eq!(
+        (ev["text"].as_str(), ev["uncertain"].as_bool()),
+        (
+            Some("Please hold still, I need a clearer view."),
+            Some(true)
+        )
+    );
+    let (ev, seq, _) = frames_until_news(&h, &mut rx, &url("frames"), token, 3, seq).await;
+    assert_eq!(
+        (ev["text"].as_str(), ev["routeStepId"].as_str()),
+        (Some("Keep going straight."), Some("n5"))
+    );
+    assert_eq!(h.nav.lock().unwrap().route_request["start"], "n5");
+    assert_eq!(route_calls(), 3);
 
     // Stop while the navigation model is still thinking: the late answer is never emitted.
-    set_nav("n7", continue_to("corridor", "n7"), 300);
+    set_nav("n7", h.nav.lock().unwrap().route.clone(), 300);
     assert_eq!(
-        post_frame("f14", 3, 14, now_ms()).await.unwrap().status(),
+        post_frame("g99", 3, seq, now_ms()).await.unwrap().status(),
         202
     );
     let r: Value = h
@@ -558,7 +681,7 @@ async fn sessions_frames_worker_and_stop() {
         (
             Some("navigating"),
             Some(session2.as_str()),
-            Some("corridor"),
+            Some("n5"),
             Some(5)
         )
     );
@@ -574,7 +697,7 @@ async fn sessions_frames_worker_and_stop() {
         .text()
         .await
         .unwrap();
-    assert!(t.contains("\"framesSent\":4") && !t.contains(token));
+    assert!(t.contains("\"framesSent\":1") && t.contains("vote target") && !t.contains(token));
 }
 
 async fn local_server(vars: &[(&str, &str)]) -> String {
@@ -740,12 +863,20 @@ async fn should_keep_a_changed_direction_quiet_when_jev_says_it_is_not_worth_say
     {
         let mut n = h.nav.lock().unwrap();
         n.found = confirmed("start");
-        n.route = hop(
-            "start",
-            "corridor",
-            "straight",
-            Some("Walk 10 m along the wall."),
-        );
+        n.route = path(&[
+            (
+                "start",
+                "corridor",
+                "straight",
+                Some("Walk 10 m along the wall."),
+            ),
+            (
+                "corridor",
+                "n2",
+                "straight",
+                Some("Keep walking along the wall."),
+            ),
+        ]);
     }
     let form = Form::new()
         .text("meta", meta("u1", 1, 0, now_ms()))
@@ -764,20 +895,9 @@ async fn should_keep_a_changed_direction_quiet_when_jev_says_it_is_not_worth_say
     assert_eq!(rx.next().await["text"], "Walk 10 m along the wall.");
     assert!(h.jev_states.lock().unwrap().is_empty());
 
-    h.nav.lock().unwrap().route["hops"][0]["instruction"] = json!("Keep walking along the wall.");
-    let form = Form::new()
-        .text("meta", meta("f1", 2, 1, now_ms()))
-        .part("frame", jpeg());
-    let r = h
-        .http
-        .post(url("frames"))
-        .bearer_auth(token)
-        .multipart(form)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 202);
-    let ev = rx.next().await;
+    // The next hop only rephrases the last one: Jev keeps it quiet.
+    h.nav.lock().unwrap().found = confirmed("corridor");
+    let (ev, _, _) = frames_until_news(&h, &mut rx, &url("frames"), token, 2, 1).await;
     assert_eq!(
         (ev["type"].as_str(), ev["quietReason"].as_str()),
         (Some("heartbeat"), Some("not_worth_saying"))
@@ -788,4 +908,79 @@ async fn should_keep_a_changed_direction_quiet_when_jev_says_it_is_not_worth_say
         "Walk 10 m along the wall."
     );
     assert_eq!(state["new"]["instruction"], "Keep walking along the wall.");
+}
+
+#[tokio::test]
+async fn should_follow_the_route_hop_by_hop_to_arrival() {
+    let h = harness().await;
+    let c: Value = h
+        .http
+        .post(format!("{}/v1/clients", h.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let (cid, token) = (
+        c["clientId"].as_str().unwrap(),
+        c["clientToken"].as_str().unwrap(),
+    );
+    let url = |p: &str| format!("{}/v1/clients/{cid}/{p}", h.base);
+    let mut rx = Events::open(&h.http, format!("{}?token={token}", url("events"))).await;
+    rx.next().await;
+    {
+        let mut n = h.nav.lock().unwrap();
+        n.found = confirmed("start");
+        n.route = path(&[
+            ("start", "corridor", "straight", None),
+            ("corridor", "n2", "turn_left", None),
+        ]);
+    }
+    let form = Form::new()
+        .text("meta", meta("u1", 1, 0, now_ms()))
+        .part("audio", audio("take me to the coffee"))
+        .part("frame", jpeg());
+    let r = h
+        .http
+        .post(url("inputs"))
+        .bearer_auth(token)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 202);
+    assert_eq!(rx.next().await["phase"], "navigating");
+    assert_eq!(rx.next().await["text"], "Keep going straight.");
+
+    // The destination seen from afar doesn't skip the corridor: it is somewhere else, so the user is located
+    // again, and the destination itself is where they arrive.
+    h.nav.lock().unwrap().found = confirmed("corridor");
+    let (ev, seq, _) = frames_until_news(&h, &mut rx, &url("frames"), token, 2, 1).await;
+    assert_eq!(
+        (ev["text"].as_str(), ev["routeStepId"].as_str()),
+        (Some("Turn left."), Some("corridor"))
+    );
+    h.nav.lock().unwrap().found = confirmed("n2");
+    let (ev, seq, _) = frames_until_news(&h, &mut rx, &url("frames"), token, 2, seq).await;
+    assert_eq!(
+        (ev["action"].as_str(), ev["text"].as_str()),
+        (
+            Some("arrived"),
+            Some("You have arrived at the drinks area.")
+        )
+    );
+    assert_eq!(h.nav.lock().unwrap().route_calls, 1);
+    let form = Form::new()
+        .text("meta", meta("late", 2, seq, now_ms()))
+        .part("frame", jpeg());
+    let r = h
+        .http
+        .post(url("frames"))
+        .bearer_auth(token)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 409);
 }

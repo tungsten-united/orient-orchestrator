@@ -16,7 +16,9 @@ use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::pipeline::{self, Audio, Command, Destination, Output, Pipeline, Route, Vars, var};
+use crate::pipeline::{
+    self, Ask, Audio, Caller, Command, Destination, Output, Pipeline, Route, Vars, Vote, var,
+};
 
 const AUDIO_TYPES: [&str; 2] = ["audio/webm", "audio/mp4"];
 const NAV_FAILURES_BEFORE_ERROR: u32 = 3;
@@ -148,14 +150,13 @@ struct Meta {
     sequence: i64,
     captured_at: i64,
     client_route_step_id: Option<String>,
-    motion: Option<Motion>,
+    motion: Option<Value>, // the phone's motion estimate (contracts.md, "Motion"), passed on to nav-api as sent
 }
 
-/// The phone's motion estimate (contracts.md, "Motion"); only the heading is used.
-#[derive(Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct Motion {
-    heading_deg: Option<f64>,
+impl Meta {
+    fn step_count(&self) -> Option<i64> {
+        self.motion.as_ref()?["stepCount"].as_i64()
+    }
 }
 
 #[derive(Deserialize)]
@@ -182,36 +183,80 @@ struct RetryBody {
     from: RetryFrom,
 }
 
+/// The navigation loop's state (contracts.md section 2, "Navigation loop"): locating while there is no path,
+/// otherwise following `path[hop]`. nav-api is stateless; this is the only place the user's progress lives.
+#[derive(Clone, Default)]
+struct Nav {
+    node: Option<String>, // the user's node: the last one reached, carried into the next session
+    node_steps: Option<i64>, // the phone's stepCount when they reached it (localize's previous_step_count)
+    path: Option<Vec<Value>>, // the route's hops, kept from the one `route` call
+    hop: usize,
+    votes: VecDeque<Vote>,
+    lost_run: u32, // `lost` results in a row while following
+}
+
+impl Nav {
+    /// A fresh start from the same place: locate again, keep the node.
+    fn relocate(&self) -> Nav {
+        Nav {
+            node: self.node.clone(),
+            node_steps: self.node_steps,
+            ..Nav::default()
+        }
+    }
+
+    /// The `localize` question: the hop being followed, or (locating) the last node, so nav-api can mark the nodes
+    /// the user can't have walked to yet.
+    fn ask(&self) -> Ask {
+        let hop = self.path.as_ref().map(|p| &p[self.hop]);
+        let field = |k: &str| hop.and_then(|h| h[k].as_str()).map(String::from);
+        Ask {
+            previous: if hop.is_some() {
+                field("source")
+            } else {
+                self.node.clone()
+            },
+            expected: field("target"),
+            previous_step_count: self.node_steps,
+        }
+    }
+}
+
 /// One spoken action: guidance to one destination.
 struct Session {
     id: String,
     destination: Destination,
-    node: Option<String>,
+    nav: Nav,
     frames: VecDeque<(Meta, Vec<u8>)>, // last `nav_frames` accepted frames, oldest first
-    pending: Option<Meta>,             // newest frame not evaluated yet
-    previous: Option<Output>,          // the worker compares each output with this one
+    sent_upto: i64, // sequence of the newest frame sent to localize: each frame goes once
+    pending: Option<Meta>, // newest frame not evaluated yet
+    previous: Option<Output>, // the worker compares each output with this one
     last_spoken_at: i64,
     arrived: bool,
     nav_failures: u32,
-    ahead: Vec<String>,
-    streak: (String, u32),
 }
 
 impl Session {
-    fn new(destination: Destination, node: Option<String>) -> Self {
+    fn new(destination: Destination, nav: Nav) -> Self {
         Session {
             id: uuid::Uuid::new_v4().to_string(),
             destination,
-            node,
+            nav,
             frames: VecDeque::new(),
+            sent_upto: -1,
             pending: None,
             previous: None,
             last_spoken_at: 0,
             arrived: false,
             nav_failures: 0,
-            ahead: Vec::new(),
-            streak: (String::new(), 0),
         }
+    }
+
+    fn unsent(&self) -> usize {
+        self.frames
+            .iter()
+            .filter(|(m, _)| m.sequence > self.sent_upto)
+            .count()
     }
 }
 
@@ -291,7 +336,7 @@ impl Client {
             "phase": self.phase(),
             "sessionId": self.session.as_ref().map(|s| &s.id),
             "destinationId": self.session.as_ref().map(|s| &s.destination.destination_id),
-            "routeStepId": self.session.as_ref().map(|s| &s.node),
+            "routeStepId": self.session.as_ref().map(|s| &s.nav.node),
         })
     }
 
@@ -318,12 +363,17 @@ impl Client {
         self.stopped = true;
     }
 
-    /// A different action: new session, empty frame buffer, no previous output.
+    /// A different action: new session, empty frame buffer, no previous output. It locates the user again, from
+    /// the last node reached.
     fn start_session(&mut self, destination: Destination) {
         self.reset();
         self.stopped = false;
-        let node = self.session.as_ref().and_then(|s| s.node.clone());
-        self.session = Some(Session::new(destination, node));
+        let nav = self
+            .session
+            .as_ref()
+            .map(|s| s.nav.relocate())
+            .unwrap_or_default();
+        self.session = Some(Session::new(destination, nav));
     }
 
     fn log(&mut self, request_id: Option<&str>, kind: &str, fields: Value) {
@@ -332,7 +382,7 @@ impl Client {
                 "at": now_ms(), "clientId": self.id,
                 "sessionId": self.session.as_ref().map(|s| &s.id), "generation": self.generation,
                 "requestId": request_id, "kind": kind, "phase": self.phase(), "clientRouteStepId": null,
-                "routeStepId": self.session.as_ref().and_then(|s| s.node.as_ref()),
+                "routeStepId": self.session.as_ref().and_then(|s| s.nav.node.as_ref()),
                 "destinationId": self.session.as_ref().map(|s| &s.destination.destination_id),
                 "transcript": null, "command": null, "engine": null, "framesSent": null,
                 "action": null, "confidence": null, "observation": null, "spoke": false,
@@ -365,18 +415,15 @@ impl Client {
     }
 }
 
-/// Every accepted frame joins the session's buffer. Only the newest one triggers an evaluation;
-/// one still waiting is superseded, but its image stays in the buffer.
+/// Every accepted frame joins the session's buffer. An evaluation sends `localize` the frames it has not sent before,
+/// so a frame that arrives during a call goes with the next one.
 fn submit_frame(app: &App, cref: &ClientRef, c: &mut Client, meta: Meta, frame: Vec<u8>) {
     let Some(s) = c.session.as_mut() else { return };
     s.frames.push_back((meta.clone(), frame));
     while s.frames.len() > app.limits.nav_frames {
         s.frames.pop_front();
     }
-    let superseded = s.pending.replace(meta).map(|m| m.request_id);
-    if let Some(rid) = superseded {
-        c.log(Some(&rid), "frame", json!({"dropped": "superseded"}));
-    }
+    s.pending = Some(meta);
     if c.worker.is_none() {
         c.worker = Some(c.generation);
         spawn(worker(app.clone(), cref.clone(), c.generation));
@@ -756,6 +803,8 @@ pub fn retry(cref: &ClientRef, body: &[u8]) -> ApiResult<Value> {
         s.previous = None;
         s.arrived = false;
         s.nav_failures = 0;
+        s.nav.votes.clear();
+        s.nav.lost_run = 0;
     }
     let state = c.state();
     c.emit("state", Some(&b.request_id), state.clone());
@@ -907,14 +956,18 @@ async fn handle_input(
     }
 }
 
-/// One worker per client and generation: evaluates the newest frame against the session's buffer.
-/// A worker from an older generation stops at its next turn and leaves the slot to the new one.
+/// One worker per client and generation: evaluates the frames not sent to `localize` yet, once there are
+/// `NAV_BURST` of them. A worker from an older generation stops at its next turn and leaves the slot to the new one.
 async fn worker(app: App, cref: ClientRef, generation: i64) {
+    let burst = app.pipeline.nav_loop.burst.max(1);
     loop {
         let job = {
             let mut c = lock(&cref);
             let pending = if c.generation == generation {
-                c.session.as_mut().and_then(|s| s.pending.take())
+                c.session
+                    .as_mut()
+                    .filter(|s| s.unsent() >= burst)
+                    .and_then(|s| s.pending.take())
             } else {
                 None
             };
@@ -950,21 +1003,107 @@ fn nav_failed(cref: &ClientRef, started_gen: i64, rid: Option<&str>, base: &Valu
     }
 }
 
-/// Where the user is (nav-api `localize`), their next move to the destination (`route`), and whether a
-/// changed move is worth saying (Jev).
+/// What one localization did to the navigation loop.
+#[derive(Debug, PartialEq)]
+enum Move {
+    Stay,
+    Located(String),
+    Reached(String),
+    Lost,
+}
+
+/// One localization through the navigation loop (contracts.md section 2): locating, a node with `k` of the last
+/// `n` votes (or a `confirmed` result) is where the user is; following, `k` votes for the hop's target reach it,
+/// and `k` for other nodes, or `lost_calls` lost results in a row, start over. Only the hop's target can be reached.
+/// `steps` is the newest frame's stepCount. Returns the vote, how many of the last `n` agree with it, and the move.
+fn advance(
+    nav: &mut Nav,
+    found: &Value,
+    confirmed: Option<String>,
+    steps: Option<i64>,
+    cfg: &pipeline::NavLoop,
+) -> (Vote, usize, Move) {
+    let Some(path) = &nav.path else {
+        let vote = pipeline::locate_vote(found, cfg.margin);
+        let count = pipeline::tally(&mut nav.votes, vote.clone(), cfg.n);
+        let at = match (confirmed, &vote) {
+            (Some(n), _) => Some(n),
+            (None, Vote::At(n)) if count >= cfg.k => Some(n.clone()),
+            _ => None,
+        };
+        let Some(n) = at else {
+            return (vote, count, Move::Stay);
+        };
+        (nav.node, nav.node_steps) = (Some(n.clone()), steps);
+        nav.votes.clear();
+        return (vote, count, Move::Located(n));
+    };
+    let hop = &path[nav.hop];
+    let (source, target) = (
+        hop["source"].as_str().unwrap_or("").to_string(),
+        hop["target"].as_str().unwrap_or("").to_string(),
+    );
+    let last = nav.hop + 1 >= path.len();
+    let vote = pipeline::follow_vote(found, &source, &target, cfg.margin);
+    let count = pipeline::tally(&mut nav.votes, vote.clone(), cfg.n);
+    nav.lost_run = if found["status"] == "lost" {
+        nav.lost_run + 1
+    } else {
+        0
+    };
+    if vote == Vote::Target && count >= cfg.k {
+        (nav.node, nav.node_steps) = (Some(target.clone()), steps);
+        (nav.hop, nav.lost_run) = (nav.hop + 1, 0);
+        nav.votes.clear();
+        if last {
+            nav.path = None;
+        }
+        return (vote, count, Move::Reached(target));
+    }
+    if (vote == Vote::Elsewhere && count >= cfg.k) || nav.lost_run >= cfg.lost_calls {
+        *nav = nav.relocate();
+        return (vote, count, Move::Lost);
+    }
+    (vote, count, Move::Stay)
+}
+
+/// The frames not sent yet go to nav-api's `localize` as one vote in the navigation loop; once the user is located,
+/// one `route` to the destination; then the current hop becomes the output, and Jev says whether a change is worth
+/// saying.
 async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
-    let (started_gen, node, dest, frames, previous, last_spoken_at, ahead, mut streak) = {
-        let c = lock(cref);
-        let Some(s) = &c.session else { return };
+    let (started_gen, dest, mut nav, frames, steps, previous, last_spoken_at, caller) = {
+        let mut c = lock(cref);
+        let (generation, client) = (c.generation, c.id.clone());
+        let Some(s) = c.session.as_mut() else { return };
+        let unsent: Vec<&(Meta, Vec<u8>)> = s
+            .frames
+            .iter()
+            .filter(|(f, _)| f.sequence > s.sent_upto)
+            .collect();
+        let Some((newest, _)) = unsent.last() else {
+            return;
+        };
+        let steps = newest.step_count();
+        let sent_upto = newest.sequence;
+        let frames: Vec<(Option<Value>, Vec<u8>)> = unsent
+            .iter()
+            .map(|(f, data)| (f.motion.clone(), data.clone()))
+            .collect();
+        s.sent_upto = sent_upto;
+        let caller = Caller {
+            client,
+            session: Some(s.id.clone()),
+            request: m.request_id.clone(),
+        };
         (
-            c.generation,
-            s.node.clone(),
+            generation,
             s.destination.clone(),
-            s.frames.iter().cloned().collect::<Vec<_>>(),
+            s.nav.clone(),
+            frames,
+            steps,
             s.previous.clone(),
             s.last_spoken_at,
-            s.ahead.clone(),
-            s.streak.clone(),
+            caller,
         )
     };
     let goal = dest.destination_id.as_str();
@@ -975,41 +1114,59 @@ async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
         "clientRouteStepId": m.client_route_step_id, "engine": app.pipeline.engine, "framesSent": frames.len(),
     });
     let t = now_ms();
-    let images = frames.into_iter().map(|(_, data)| data).collect();
-    let heading = m.motion.as_ref().and_then(|mo| mo.heading_deg);
-    let found = match app.pipeline.locate(images, node.as_deref(), heading).await {
+    let ask = nav.ask();
+    let doing = match (&ask.expected, &ask.previous) {
+        (Some(target), Some(source)) => format!("{source} → {target}"),
+        _ => "locating".to_string(),
+    };
+    let found = match app.pipeline.locate(frames, &ask, &caller).await {
         Ok(found) => found,
         Err(e) => return nav_failed(cref, started_gen, rid, &base, format!("localize: {e}")),
     };
     timings.insert("localize".into(), json!(now_ms() - t));
+    let cfg = app.pipeline.nav_loop;
+    let (vote, count, mv) = advance(&mut nav, &found, app.pipeline.located(&found), steps, &cfg);
+    let moved = match &mv {
+        Move::Stay => String::new(),
+        Move::Located(n) => format!(" → located at {n}"),
+        Move::Reached(n) => format!(" → reached {n}"),
+        Move::Lost => " → lost: locating again".to_string(),
+    };
+    let observation = format!(
+        "{doing}: vote {} ({count} of the last {}){moved} · {}: {}",
+        vote.name(),
+        cfg.n,
+        found["status"].as_str().unwrap_or(""),
+        found["reason"].as_str().unwrap_or("")
+    );
     base = merge(
         &base,
-        json!({"confidence": found["candidates"][0]["score"], "observation": format!("{}: {}", found["status"].as_str().unwrap_or(""), found["reason"].as_str().unwrap_or("")), "localize": found}),
+        json!({"confidence": found["candidates"][0]["score"], "observation": observation, "localize": found}),
     );
-    let followed = app.pipeline.followed(&found, &mut streak, &ahead);
-    let here = app.pipeline.located(&found).or(followed).or(node);
-    let mut ahead = Vec::new();
-    let output = match here.as_deref() {
-        None => Output::wait(None, true),
-        Some(n) if n == goal => Output::arrived(n),
-        Some(n) => {
-            let t = now_ms();
-            match app.pipeline.path(n, goal).await {
-                Ok(path) => {
-                    timings.insert("route".into(), json!(now_ms() - t));
-                    ahead = path["hops"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|h| h["target"].as_str().map(String::from))
-                        .collect();
-                    let output = app.pipeline.validate(&path, n);
-                    base = merge(&base, json!({"route": path}));
-                    output
+    let arrived = matches!(&mv, Move::Located(n) | Move::Reached(n) if n == goal);
+    if let Move::Located(n) = &mv
+        && !arrived
+    {
+        let t = now_ms();
+        match app.pipeline.path(n, goal, &caller).await {
+            Ok(route) => {
+                timings.insert("route".into(), json!(now_ms() - t));
+                let hops = route["hops"].as_array().cloned().unwrap_or_default();
+                if route["found"] == true && hops.first().is_some_and(|h| h["source"] == n.as_str())
+                {
+                    (nav.path, nav.hop) = (Some(hops), 0);
                 }
-                Err(e) => return nav_failed(cref, started_gen, rid, &base, format!("route: {e}")),
+                base = merge(&base, json!({"route": route}));
             }
+            Err(e) => return nav_failed(cref, started_gen, rid, &base, format!("route: {e}")),
         }
+    }
+    let output = match &nav.path {
+        _ if arrived => Output::arrived(goal),
+        Some(path) => app
+            .pipeline
+            .hop_output(&path[nav.hop], nav.node.as_deref().unwrap_or("")),
+        None => Output::wait(nav.node.as_deref(), true), // locating: "Please hold still"
     };
 
     let now = now_ms();
@@ -1056,10 +1213,8 @@ async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
         .as_mut()
         .expect("same generation keeps the session");
     s.nav_failures = 0;
-    s.ahead = ahead;
-    s.streak = streak;
-    s.node = output.step.clone();
-    s.arrived = output.action == "arrived";
+    s.nav = nav;
+    s.arrived = arrived;
     s.previous = Some(output.clone());
     if speak {
         s.last_spoken_at = now;
@@ -1094,6 +1249,164 @@ async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
 mod tests {
     use super::*;
     use futures::StreamExt;
+
+    fn found(status: &str, best: &str, margin: f64) -> Value {
+        json!({"status": status, "best": best, "margin": margin, "candidates": [{"node": best, "score": 0.4}]})
+    }
+
+    fn path() -> Vec<Value> {
+        ["n1", "n2", "n3", "n4"]
+            .windows(2)
+            .map(|w| json!({"source": w[0], "target": w[1], "steps": [{"action": "straight"}]}))
+            .collect()
+    }
+
+    const CFG: pipeline::NavLoop = pipeline::NavLoop {
+        burst: 1,
+        k: 3,
+        n: 4,
+        margin: 0.04,
+        lost_calls: 10,
+    };
+
+    #[test]
+    fn should_locate_on_agreeing_votes_or_at_once_on_a_confirmed_result() {
+        let mut nav = Nav::default();
+        let ask = nav.ask();
+        assert_eq!((ask.previous, ask.expected), (None, None));
+        for _ in 0..2 {
+            let (_, _, mv) = advance(
+                &mut nav,
+                &found("uncertain", "n1", 0.05),
+                None,
+                Some(3),
+                &CFG,
+            );
+            assert_eq!(mv, Move::Stay);
+        }
+        let (vote, count, mv) = advance(
+            &mut nav,
+            &found("uncertain", "n1", 0.05),
+            None,
+            Some(4),
+            &CFG,
+        );
+        assert_eq!(
+            (vote, count, mv),
+            (Vote::At("n1".into()), 3, Move::Located("n1".into()))
+        );
+        assert_eq!((nav.node.as_deref(), nav.node_steps), (Some("n1"), Some(4)));
+        let mut nav = Nav::default();
+        let (_, _, mv) = advance(
+            &mut nav,
+            &found("confirmed", "n2", 0.1),
+            Some("n2".into()),
+            None,
+            &CFG,
+        );
+        assert_eq!(mv, Move::Located("n2".into()));
+    }
+
+    #[test]
+    fn should_reach_only_the_hop_s_target_and_start_over_when_lost() {
+        let mut nav = Nav {
+            node: Some("n1".into()),
+            node_steps: Some(4),
+            path: Some(path()),
+            ..Nav::default()
+        };
+        let ask = nav.ask();
+        assert_eq!(
+            (
+                ask.previous.as_deref(),
+                ask.expected.as_deref(),
+                ask.previous_step_count
+            ),
+            (Some("n1"), Some("n2"), Some(4))
+        );
+        // low scores are fine: the target leading in 3 of the last 4 reaches it
+        for f in [
+            found("uncertain", "n2", 0.05),
+            found("uncertain", "n1", 0.05),
+            found("uncertain", "n2", 0.05),
+        ] {
+            assert_eq!(advance(&mut nav, &f, None, Some(9), &CFG).2, Move::Stay);
+        }
+        let (_, _, mv) = advance(
+            &mut nav,
+            &found("uncertain", "n2", 0.05),
+            None,
+            Some(11),
+            &CFG,
+        );
+        assert_eq!(mv, Move::Reached("n2".into()));
+        assert_eq!((nav.hop, nav.node_steps), (1, Some(11)));
+        assert_eq!(nav.ask().expected.as_deref(), Some("n3"));
+        // the goal seen from afar, even confirmed, doesn't skip n3: it's elsewhere, and three of those start over
+        for _ in 0..2 {
+            let (vote, _, mv) = advance(
+                &mut nav,
+                &found("confirmed", "n4", 0.2),
+                Some("n4".into()),
+                None,
+                &CFG,
+            );
+            assert_eq!((vote, mv), (Vote::Elsewhere, Move::Stay));
+        }
+        let (_, _, mv) = advance(
+            &mut nav,
+            &found("confirmed", "n4", 0.2),
+            Some("n4".into()),
+            None,
+            &CFG,
+        );
+        assert_eq!(mv, Move::Lost);
+        assert!(nav.path.is_none() && nav.votes.is_empty());
+        let ask = nav.ask();
+        assert_eq!(
+            (
+                ask.previous.as_deref(),
+                ask.expected,
+                ask.previous_step_count
+            ),
+            (Some("n2"), None, Some(11))
+        );
+    }
+
+    #[test]
+    fn should_start_over_after_a_run_of_lost_results_and_end_the_path_at_its_last_hop() {
+        let cfg = pipeline::NavLoop {
+            lost_calls: 3,
+            k: 1,
+            ..CFG
+        };
+        let mut nav = Nav {
+            node: Some("n1".into()),
+            path: Some(path()),
+            ..Nav::default()
+        };
+        assert_eq!(
+            advance(&mut nav, &found("lost", "n9", 0.2), None, None, &cfg).2,
+            Move::Stay
+        );
+        assert_eq!(
+            advance(&mut nav, &found("lost", "n9", 0.2), None, None, &cfg).2,
+            Move::Stay
+        );
+        assert_eq!(
+            advance(&mut nav, &found("lost", "n9", 0.2), None, None, &cfg).2,
+            Move::Lost
+        );
+        let mut nav = Nav {
+            node: Some("n3".into()),
+            path: Some(path()),
+            hop: 2,
+            ..Nav::default()
+        };
+        let (_, _, mv) = advance(&mut nav, &found("uncertain", "n4", 0.05), None, None, &cfg);
+        assert_eq!(mv, Move::Reached("n4".into()));
+        assert!(nav.path.is_none());
+    }
 
     #[test]
     fn should_stamp_every_trace_entry_with_the_app_version() {
