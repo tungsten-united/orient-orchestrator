@@ -99,7 +99,7 @@ pub struct NavLoop {
     pub k: usize,     // NAV_VOTE_K: votes needed ...
     pub n: usize,     // NAV_VOTE_N: ... among the last n localizations
     pub margin: f64, // NAV_MARGIN: a result votes only when its best node leads the second by this much
-    pub lost_calls: u32, // NAV_LOST_CALLS: `lost` results in a row, while following, that start a new navigation
+    pub lost_ms: i64, // NAV_LOST_MS: following, no result pointing at the hop for this long starts a new navigation
     pub locate_lost_margin: f64, // NAV_LOCATE_LOST_MARGIN: locating, a `lost` result votes when its best leads by this
 }
 
@@ -167,11 +167,16 @@ pub fn locate_vote(found: &Value, margin: f64, lost_margin: f64) -> Vote {
     leader(found, margin, Some(lost_margin)).map_or(Vote::Abstain, |n| Vote::At(n.into()))
 }
 
-/// Following the hop `source -> target`: has the user reached the target, or are they somewhere else?
+/// Following the hop `source -> target`: has the user reached the target, or are they somewhere else? Only a
+/// `confirmed` result says elsewhere: nav-api confirms a node only next to the hop's source, or within what the user
+/// walked. An `uncertain` one led by another node is mostly noise (Itnig, 2026-10-10: 53 of 70 elsewhere votes were
+/// uncertain, 24 of them a node nav-api called "not next to the last confirmed node", and they caused 15 of the 20
+/// restarts, each one "Please hold still" to a user who was walking). The target still counts from any lead, and a
+/// long stretch of other nodes leading starts over too (`NAV_LOST_MS`, `advance` in client.rs).
 pub fn follow_vote(found: &Value, source: &str, target: &str, margin: f64) -> Vote {
     match leader(found, margin, None) {
         Some(n) if n == target => Vote::Target,
-        Some(n) if n != source => Vote::Elsewhere,
+        Some(n) if n != source && found["status"] == "confirmed" => Vote::Elsewhere,
         _ => Vote::Abstain,
     }
 }
@@ -368,7 +373,7 @@ impl Pipeline {
                 k: env("NAV_VOTE_K", "3").parse().expect("NAV_VOTE_K"),
                 n: env("NAV_VOTE_N", "4").parse().expect("NAV_VOTE_N"),
                 margin: env("NAV_MARGIN", "0.04").parse().expect("NAV_MARGIN"),
-                lost_calls: env("NAV_LOST_CALLS", "10").parse().expect("NAV_LOST_CALLS"),
+                lost_ms: env("NAV_LOST_MS", "6000").parse().expect("NAV_LOST_MS"),
                 locate_lost_margin: env("NAV_LOCATE_LOST_MARGIN", "0.06")
                     .parse()
                     .expect("NAV_LOCATE_LOST_MARGIN"),
@@ -787,10 +792,14 @@ mod tests {
             follow_vote(&found("confirmed", "n4", 0.1), "n4", "n5", 0.04),
             Vote::Abstain
         );
-        // the goal seen from afar is not the next node
+        // another node confirmed is elsewhere, the goal seen from afar too; merely leading, it says nothing
+        assert_eq!(
+            follow_vote(&found("confirmed", "n8", 0.1), "n4", "n5", 0.04),
+            Vote::Elsewhere
+        );
         assert_eq!(
             follow_vote(&found("uncertain", "n8", 0.1), "n4", "n5", 0.04),
-            Vote::Elsewhere
+            Vote::Abstain
         );
     }
 
