@@ -87,7 +87,7 @@ Then, in GitHub, create the environment `staging` (Settings > Environments) with
 
 ### Session logs
 
-Staging prints every trace entry to Cloud Logging. Each entry has `clientId`, `sessionId`, `requestId`, `kind`, the step's outcome and timings, and which app produced it: `commit`, `version` and `routeId`. Find them in Logs Explorer, or:
+Staging prints every trace entry to Cloud Logging. Each entry has `clientId`, `sessionId`, `requestId`, `kind`, the step's outcome and timings, and which app produced it: `commit`, `version` and `routeId`. Each entry also has a `message`, the summary line in the service's Logs tab (`[c2cd8407] frame @corridor · turn → “Turn left.”`), and a `severity`, so errors stand out. Lines the web app posts to `POST /v1/logs` read `[<id>] web · <event> <detail>`. Find them in Logs Explorer, or:
 
 ```bash
 # One session

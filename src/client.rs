@@ -311,7 +311,7 @@ impl Client {
             merge(&self.stamp, fields),
         );
         if self.trace_stdout {
-            println!("{entry}"); // one JSON line: Cloud Logging stores it as a structured entry
+            println!("{}", for_cloud_logging(&entry)); // one JSON line: Cloud Logging stores it as a structured entry
         }
         if let Some(path) = &self.trace_path
             && let Ok(mut f) = std::fs::OpenOptions::new()
@@ -380,6 +380,37 @@ pub fn bad_request(message: impl ToString) -> ApiError {
 
 pub type ApiResult<T> = Result<T, ApiError>;
 
+/// A trace entry with the `message` and `severity` fields Cloud Logging shows on the summary line.
+///
+/// `{kind: "input", clientId: "c2cd8407-…", transcript: "take me to the coffee", command: "counter"}`
+/// gets `message: "[c2cd8407] input · “take me to the coffee” → counter"`.
+fn for_cloud_logging(entry: &Value) -> Value {
+    let s = |k: &str| entry[k].as_str().unwrap_or("");
+    let what = if !s("error").is_empty() {
+        format!("error: {}", s("error"))
+    } else if !s("dropped").is_empty() {
+        format!("{} dropped: {}", s("action"), s("dropped"))
+    } else if s("kind") == "input" {
+        format!("“{}” → {}", s("transcript"), s("command"))
+    } else if entry["spoke"] == true {
+        format!("{} → “{}”", s("action"), s("text"))
+    } else {
+        s("action").to_string()
+    };
+    let step = match s("routeStepId") {
+        "" => String::new(),
+        step => format!(" @{step}"),
+    };
+    let id: String = s("clientId").chars().take(8).collect();
+    merge(
+        entry,
+        json!({
+            "message": format!("[{id}] {}{step} · {what}", s("kind")).trim_end_matches(" · ").to_string(),
+            "severity": if s("error").is_empty() { "INFO" } else { "ERROR" },
+        }),
+    )
+}
+
 /// Debug lines the phone posts to `POST /v1/logs`. Each becomes one structured entry on stdout,
 /// next to the server's own trace, so one Cloud Logging query shows both sides of a session.
 /// Failures before a client exists (permissions, no camera) are only visible this way.
@@ -417,11 +448,16 @@ pub fn client_logs(app: &App, body: &[u8]) -> ApiResult<Vec<Value>> {
                 .and_then(Value::as_str)
                 .filter(|l| ["info", "warn", "error"].contains(l))
                 .unwrap_or("info");
+            let event = text(e, "event", 64);
+            let detail = text(e, "detail", 1000);
+            let id: String = client_id.as_deref().or(device_id.as_deref()).unwrap_or("").chars().take(8).collect();
             json!({
+                "message": format!("[{id}] web · {} {}", event.as_deref().unwrap_or(""), detail.as_deref().unwrap_or("")).trim_end(),
+                "severity": match level { "warn" => "WARNING", "error" => "ERROR", _ => "INFO" },
                 "kind": "client_log", "source": "web", "level": level,
                 "at": e.get("at").and_then(Value::as_i64), "receivedAt": received_at,
                 "deviceId": device_id, "clientId": client_id,
-                "event": text(e, "event", 64), "detail": text(e, "detail", 1000),
+                "event": event, "detail": detail,
                 "commit": app.commit, "version": env!("CARGO_PKG_VERSION"),
             })
         })
@@ -1025,6 +1061,41 @@ mod tests {
     }
 
     #[test]
+    fn should_summarise_trace_entries_for_cloud_logging() {
+        let msg = |e: Value| {
+            let out = for_cloud_logging(&e);
+            (
+                out["message"].as_str().unwrap().to_string(),
+                out["severity"].as_str().unwrap().to_string(),
+            )
+        };
+        let id = json!("c2cd8407-c53d");
+        assert_eq!(
+            msg(json!({"clientId": id, "kind": "input", "transcript": "take me to the coffee", "command": "counter"})).0,
+            "[c2cd8407] input · “take me to the coffee” → counter"
+        );
+        assert_eq!(
+            msg(json!({"clientId": id, "kind": "frame", "routeStepId": "corridor", "action": "turn", "spoke": true, "text": "Turn left."})).0,
+            "[c2cd8407] frame @corridor · turn → “Turn left.”"
+        );
+        assert_eq!(
+            msg(json!({"clientId": id, "kind": "frame", "action": "turn", "dropped": "stale_generation"})).0,
+            "[c2cd8407] frame · turn dropped: stale_generation"
+        );
+        assert_eq!(
+            msg(json!({"clientId": id, "kind": "frame", "error": "navigate: timeout"})),
+            (
+                "[c2cd8407] frame · error: navigate: timeout".into(),
+                "ERROR".into()
+            )
+        );
+        assert_eq!(
+            msg(json!({"clientId": id, "kind": "client"})).0,
+            "[c2cd8407] client"
+        );
+    }
+
+    #[test]
     fn should_send_to_every_subscriber_and_forget_closed_ones() {
         let mut events = Events::default();
         let mut a = events.subscribe();
@@ -1047,6 +1118,7 @@ mod tests {
         let out = client_logs(&app, body).ok().unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0]["kind"], "client_log");
+        assert!(out[0]["message"].as_str().unwrap().contains(" web · "));
         assert_eq!(out[0]["level"], "error");
         assert_eq!(out[0]["detail"], "NotAllowedError");
         assert_eq!(out[0]["commit"], "abc123");
