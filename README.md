@@ -135,13 +135,15 @@ To require approval before each release, add required reviewers to the `staging`
 | `ELEVENLABS_TTS_MODEL` | `eleven_flash_v2_5` | Text-to-speech model, the lowest latency |
 | `ELEVENLABS_VOICE_ID` | unset | Voice for `GET /speech`, picked in S06. Unset: `GET /speech` answers 503 and the phone uses browser TTS |
 | `SPEECH_LANGUAGE` | `en` | Sent to ElevenLabs for both directions, so Scribe skips language detection |
+| `FRAME_GAP_MS` | `100` | `limits.frameGapMs`: the phone waits this long after each frame upload, so it sets the pace of `localize` calls (each takes about 100 ms) |
+| `MAX_FRAME_EDGE_PX` | `640` | `limits.maxFrameEdgePx`: longest edge of the phone's frames. nav-api squashes them to 322 px, so larger ones only cost upload time |
 | `NAV_FRAMES` | `4` | Frames per `localize` call (nav-api takes at most 4) |
 | `NAV_BURST` | `1` | Frames not sent to `localize` yet that start an evaluation (each frame is sent once) |
 | `NAV_VOTE_K` | `3` | Votes needed among the last `NAV_VOTE_N` localizations to locate the user, reach the hop's target, or call them lost |
 | `NAV_VOTE_N` | `4` | Window of the votes |
 | `NAV_MARGIN` | `0.04` | A localization votes only when its best node leads the second by this much |
 | `NAV_LOCATE_LOST_MARGIN` | `0.06` | While locating, a `lost` result (all scores low) votes for its best node when it leads by this much (`1` turns it off) |
-| `NAV_LOST_CALLS` | `10` | `lost` results in a row, while following, that start a new navigation |
+| `NAV_LOST_CALLS` | `10` | `lost` results in a row, while following, that start a new navigation. A count, not a time: at about 3 calls a second, 10 is about 3 s |
 | `ROUTE_PATH` | built-in `src/route.json` | Route definition |
 | `MAX_INPUT_AGE_MS` | `3000` | Reject older input |
 | `TRACE_PATH` | unset | Also append the run trace as JSON lines to this file |
