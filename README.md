@@ -143,7 +143,7 @@ To require approval before each release, add required reviewers to the `staging`
 | `NAV_VOTE_N` | `4` | Window of the votes |
 | `NAV_MARGIN` | `0.04` | A localization votes only when its best node leads the second by this much |
 | `NAV_LOCATE_LOST_MARGIN` | `0.06` | While locating, a `lost` result (all scores low) votes for its best node when it leads by this much (`1` turns it off) |
-| `NAV_LOST_CALLS` | `10` | `lost` results in a row, while following, that start a new navigation. A count, not a time: at about 3 calls a second, 10 is about 3 s |
+| `NAV_LOST_MS` | `6000` | Following, no result pointing at the hop for this long (by the frames' `capturedAt`) starts a new navigation: every one `lost`, or led by a node off the hop. A time, so the frame rate doesn't change it |
 | `ROUTE_PATH` | built-in `src/route.json` | Route definition |
 | `MAX_INPUT_AGE_MS` | `3000` | Reject older input |
 | `TRACE_PATH` | unset | Also append the run trace as JSON lines to this file |

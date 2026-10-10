@@ -198,7 +198,7 @@ struct Nav {
     path: Option<Vec<Value>>, // the route's hops, kept from the one `route` call
     hop: usize,
     votes: VecDeque<Vote>,
-    lost_run: u32, // `lost` results in a row while following
+    off_hop_since: Option<i64>, // following: capturedAt of the first of the results in a row not pointing at the hop
 }
 
 impl Nav {
@@ -810,7 +810,7 @@ pub fn retry(cref: &ClientRef, body: &[u8]) -> ApiResult<Value> {
         s.arrived = false;
         s.nav_failures = 0;
         s.nav.votes.clear();
-        s.nav.lost_run = 0;
+        s.nav.off_hop_since = None;
     }
     let state = c.state();
     c.emit("state", Some(&b.request_id), state.clone());
@@ -1019,14 +1019,17 @@ enum Move {
 }
 
 /// One localization through the navigation loop (contracts.md section 2): locating, a node with `k` of the last
-/// `n` votes (or a `confirmed` result) is where the user is; following, `k` votes for the hop's target reach it,
-/// and `k` for other nodes, or `lost_calls` lost results in a row, start over. Only the hop's target can be reached.
-/// `steps` is the newest frame's stepCount. Returns the vote, how many of the last `n` agree with it, and the move.
+/// `n` votes (or a `confirmed` result) is where the user is; following, `k` votes for the hop's target reach it.
+/// Two things start over: `k` votes for another node (only `confirmed` results cast them, `follow_vote`), or no result
+/// pointing at the hop for `lost_ms`: each one `lost`, or led by a node that is neither the hop's source nor its
+/// target. Brief noise doesn't drop the route, a long stretch of it does. Only the hop's target can be reached.
+/// `steps` and `at` are the newest frame's stepCount and capturedAt. Returns the vote, how many of the last `n` agree
+/// with it, and the move.
 fn advance(
     nav: &mut Nav,
     found: &Value,
     confirmed: Option<String>,
-    steps: Option<i64>,
+    (steps, at): (Option<i64>, i64),
     cfg: &pipeline::NavLoop,
 ) -> (Vote, usize, Move) {
     let Some(path) = &nav.path else {
@@ -1052,21 +1055,20 @@ fn advance(
     let last = nav.hop + 1 >= path.len();
     let vote = pipeline::follow_vote(found, &source, &target, cfg.margin);
     let count = pipeline::tally(&mut nav.votes, vote.clone(), cfg.n);
-    nav.lost_run = if found["status"] == "lost" {
-        nav.lost_run + 1
-    } else {
-        0
-    };
+    let best = found["best"].as_str().unwrap_or("");
+    let on_hop = found["status"] != "lost" && (best == source || best == target);
+    nav.off_hop_since = (!on_hop).then(|| nav.off_hop_since.unwrap_or(at));
     if vote == Vote::Target && count >= cfg.k {
         (nav.node, nav.node_steps) = (Some(target.clone()), steps);
-        (nav.hop, nav.lost_run) = (nav.hop + 1, 0);
+        (nav.hop, nav.off_hop_since) = (nav.hop + 1, None);
         nav.votes.clear();
         if last {
             nav.path = None;
         }
         return (vote, count, Move::Reached(target));
     }
-    if (vote == Vote::Elsewhere && count >= cfg.k) || nav.lost_run >= cfg.lost_calls {
+    let off_hop_for = nav.off_hop_since.map_or(0, |t| at - t);
+    if (vote == Vote::Elsewhere && count >= cfg.k) || off_hop_for >= cfg.lost_ms {
         *nav = nav.relocate();
         return (vote, count, Move::Lost);
     }
@@ -1131,7 +1133,8 @@ async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
     };
     timings.insert("localize".into(), json!(now_ms() - t));
     let cfg = app.pipeline.nav_loop;
-    let (vote, count, mv) = advance(&mut nav, &found, app.pipeline.located(&found), steps, &cfg);
+    let newest = (steps, m.captured_at);
+    let (vote, count, mv) = advance(&mut nav, &found, app.pipeline.located(&found), newest, &cfg);
     let moved = match &mv {
         Move::Stay => String::new(),
         Move::Located(n) => format!(" → located at {n}"),
@@ -1272,7 +1275,7 @@ mod tests {
         k: 3,
         n: 4,
         margin: 0.04,
-        lost_calls: 10,
+        lost_ms: 6000,
         locate_lost_margin: 0.06,
     };
 
@@ -1286,7 +1289,7 @@ mod tests {
                 &mut nav,
                 &found("uncertain", "n1", 0.05),
                 None,
-                Some(3),
+                (Some(3), 0),
                 &CFG,
             );
             assert_eq!(mv, Move::Stay);
@@ -1295,7 +1298,7 @@ mod tests {
             &mut nav,
             &found("uncertain", "n1", 0.05),
             None,
-            Some(4),
+            (Some(4), 0),
             &CFG,
         );
         assert_eq!(
@@ -1308,7 +1311,7 @@ mod tests {
             &mut nav,
             &found("confirmed", "n2", 0.1),
             Some("n2".into()),
-            None,
+            (None, 0),
             &CFG,
         );
         assert_eq!(mv, Move::Located("n2".into()));
@@ -1337,13 +1340,16 @@ mod tests {
             found("uncertain", "n1", 0.05),
             found("uncertain", "n2", 0.05),
         ] {
-            assert_eq!(advance(&mut nav, &f, None, Some(9), &CFG).2, Move::Stay);
+            assert_eq!(
+                advance(&mut nav, &f, None, (Some(9), 0), &CFG).2,
+                Move::Stay
+            );
         }
         let (_, _, mv) = advance(
             &mut nav,
             &found("uncertain", "n2", 0.05),
             None,
-            Some(11),
+            (Some(11), 0),
             &CFG,
         );
         assert_eq!(mv, Move::Reached("n2".into()));
@@ -1355,7 +1361,7 @@ mod tests {
                 &mut nav,
                 &found("confirmed", "n4", 0.2),
                 Some("n4".into()),
-                None,
+                (None, 0),
                 &CFG,
             );
             assert_eq!((vote, mv), (Vote::Elsewhere, Move::Stay));
@@ -1364,7 +1370,7 @@ mod tests {
             &mut nav,
             &found("confirmed", "n4", 0.2),
             Some("n4".into()),
-            None,
+            (None, 0),
             &CFG,
         );
         assert_eq!(mv, Move::Lost);
@@ -1381,36 +1387,43 @@ mod tests {
     }
 
     #[test]
-    fn should_start_over_after_a_run_of_lost_results_and_end_the_path_at_its_last_hop() {
-        let cfg = pipeline::NavLoop {
-            lost_calls: 3,
-            k: 1,
-            ..CFG
-        };
+    fn should_start_over_when_nothing_points_at_the_hop_for_a_while_and_end_the_path_at_its_last_hop()
+     {
+        let cfg = pipeline::NavLoop { k: 1, ..CFG };
         let mut nav = Nav {
             node: Some("n1".into()),
             path: Some(path()),
             ..Nav::default()
         };
-        assert_eq!(
-            advance(&mut nav, &found("lost", "n9", 0.2), None, None, &cfg).2,
-            Move::Stay
-        );
-        assert_eq!(
-            advance(&mut nav, &found("lost", "n9", 0.2), None, None, &cfg).2,
-            Move::Stay
-        );
-        assert_eq!(
-            advance(&mut nav, &found("lost", "n9", 0.2), None, None, &cfg).2,
-            Move::Lost
-        );
+        let (lost, other) = (found("lost", "n1", 0.2), found("uncertain", "n9", 0.2));
+        // lost results and other nodes merely leading both run the clock; the hop's source or target stops it
+        for (at, f, want) in [
+            (1_000, &lost, Move::Stay),
+            (2_000, &other, Move::Stay),
+            (6_500, &found("uncertain", "n1", 0.0), Move::Stay),
+            (7_000, &other, Move::Stay),
+            (12_900, &lost, Move::Stay),
+            (13_000, &other, Move::Lost),
+        ] {
+            assert_eq!(
+                advance(&mut nav, f, None, (None, at), &cfg).2,
+                want,
+                "at {at}"
+            );
+        }
         let mut nav = Nav {
             node: Some("n3".into()),
             path: Some(path()),
             hop: 2,
             ..Nav::default()
         };
-        let (_, _, mv) = advance(&mut nav, &found("uncertain", "n4", 0.05), None, None, &cfg);
+        let (_, _, mv) = advance(
+            &mut nav,
+            &found("uncertain", "n4", 0.05),
+            None,
+            (None, 0),
+            &cfg,
+        );
         assert_eq!(mv, Move::Reached("n4".into()));
         assert!(nav.path.is_none());
     }
