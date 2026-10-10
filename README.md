@@ -108,7 +108,7 @@ To require approval before each release, add required reviewers to the `staging`
 | `JEV_URL` | `https://api.typesafe.ai/v1/systemone` | System One endpoint |
 | `JEV_MODEL` | `jev-latest` | Jev model |
 | `JEV_MIN_CONFIDENCE` | `0.5` | Below this, the command is treated as unclear and the user is asked again |
-| `ELEVENLABS_API_KEY` | empty | ElevenLabs key (`xi-api-key`). Server only. Required unless `ELEVENLABS_URL` points at fakes: utterances return 503 without it |
+| `ELEVENLABS_API_KEY` | empty | ElevenLabs key (`xi-api-key`). Server only. Required unless `ELEVENLABS_URL` points at fakes: inputs return 503 without it |
 | `ELEVENLABS_URL` | `https://api.elevenlabs.io` | ElevenLabs base URL. Point it at `examples/fakes.rs` for local runs and staging |
 | `ELEVENLABS_STT_MODEL` | `scribe_v2` | Speech-to-text model |
 | `ELEVENLABS_TTS_MODEL` | `eleven_flash_v2_5` | Text-to-speech model, the lowest latency |
@@ -139,7 +139,7 @@ To require approval before each release, add required reviewers to the `staging`
 
 [Jev](https://docs.typesafe.ai/introduction) is a decision model. It takes a `state` and typed questions (Choice, Score, Noul) and returns calibrated answers. It does not generate text.
 
-- **Command:** one Choice question per utterance. The state is `{spokenRequest, sessionPhase}`. The options are each destination ID plus `cancel` and `unsupported`. If `confidence` is below `JEV_MIN_CONFIDENCE`, the user is asked again.
+- **Command:** one Choice question per input. The state is `{spokenRequest, sessionPhase}`. The options are each destination ID plus `cancel` and `unsupported`. If `confidence` is below `JEV_MIN_CONFIDENCE`, the user is asked again.
 - **Worker:** compares outputs in code. If that proves too rigid, this is a natural Noul question ("should the user be told something now?").
 - **Sentences:** fixed templates, because Jev doesn't write sentences.
 

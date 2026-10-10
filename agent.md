@@ -21,7 +21,7 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, clippy with `-D warnin
 
 The end-to-end test also runs against a deployment: `E2E_BASE=https://... cargo test --test e2e`. The fakes then bind :8101 (navigation) and :8102 (ElevenLabs), so point the deployment's `NAV_URL` and `ELEVENLABS_URL` there.
 
-Without `TYPESAFE_API_KEY`, the command step falls back to keyword matching on the route aliases. Speech to text is ElevenLabs Scribe (contracts.md section 4): utterances return 503 without `ELEVENLABS_API_KEY`, unless `ELEVENLABS_URL` points at fakes. The end-to-end test starts fake STT and navigation servers on random ports, so it needs no network.
+Without `TYPESAFE_API_KEY`, the command step falls back to keyword matching on the route aliases. Speech to text is ElevenLabs Scribe (contracts.md section 4): inputs return 503 without `ELEVENLABS_API_KEY`, unless `ELEVENLABS_URL` points at fakes. The end-to-end test starts fake STT and navigation servers on random ports, so it needs no network.
 
 ## Navigation model and deployment
 
@@ -41,7 +41,7 @@ cargo run --example fakes                          # fake navigation on :8001
 NAV_URL=http://localhost:8001 DEBUG_PAGE=1 cargo run   # real ElevenLabs: leave ELEVENLABS_URL unset
 ```
 
-The debug page's Say box sends typed text as fake audio, which only the fakes understand. To test real Scribe, send a recorded clip (`ffmpeg -f avfoundation -i ":0" -t 3 -c:a libopus say.webm`) as the `audio` part of `POST /utterances`.
+The debug page's Say box sends typed text as fake audio, which only the fakes understand. To test real Scribe, send a recorded clip (`ffmpeg -f avfoundation -i ":0" -t 3 -c:a libopus say.webm`) as the `audio` part of `POST /inputs`.
 
 **ElevenLabs account.** It is on the free plan, verified live on 2026-10-10 (Scribe 370 ms, Flash first byte about 0.4 s):
 
@@ -70,7 +70,7 @@ printf '%s' "$ELEVENLABS_API_KEY" | gcloud secrets versions add ELEVENLABS_API_K
 
 ## Architecture
 
-`src/client.rs` holds the state, the API operations (`utterance`, `frames`, `stop`, `retry`, `trace`, the SSE `events` stream) and the worker, with no HTTP framework. `src/pipeline.rs` holds the model calls and pure decision rules, and never touches state. `src/server.rs` (axum, run by `src/main.rs`) only parses requests, calls `client`, and writes responses. Behaviour changes go in `client.rs`. `src/route.json` is a placeholder route until S01 freezes the real one.
+`src/client.rs` holds the state, the API operations (`input`, `frames`, `stop`, `retry`, `trace`, the SSE `events` stream) and the worker, with no HTTP framework. `src/pipeline.rs` holds the model calls and pure decision rules, and never touches state. `src/server.rs` (axum, run by `src/main.rs`) only parses requests, calls `client`, and writes responses. Behaviour changes go in `client.rs`. `src/route.json` is a placeholder route until S01 freezes the real one.
 
 **Two levels of state.** A `Client` is one phone from Start to Stop. It owns the token, the open SSE streams (`Events`), and the `generation`. A `Session` is one spoken action (one destination). It owns the route step, a buffer of the last `NAV_FRAMES` (5) frames, and the previous navigation output. When speech-to-text plus Jev yields a different destination, `start_session` replaces the session. The same destination keeps it.
 
@@ -80,7 +80,7 @@ printf '%s' "$ELEVENLABS_API_KEY" | gcloud secrets versions add ELEVENLABS_API_K
 
 **Flow:**
 
-1. `utterance` checks the request, then spawns `handle_utterance`: STT, then `pipeline.command` (one Jev Choice question), then start or keep a session, cancel, or `needs_input`.
+1. `input` checks the request, then spawns `handle_input`: STT, then `pipeline.command` (one Jev Choice question), then start or keep a session, cancel, or `needs_input`.
 2. `frames` pushes each frame into the session buffer via `submit_frame`. Only the newest frame is evaluated (`pending`).
 3. A single `worker` task per client and generation (`Client.worker` holds its generation) loops over pending frames. A worker from an older generation exits at its next turn. `evaluate` sends the whole buffer to the VLA, then `pipeline.validate` turns the answer into an `Output`. The step can only move to the next step on the route. Anything else becomes `wait`, and low confidence becomes an uncertain `wait`.
 4. `pipeline.should_speak` compares the output with the session's previous output. A different output becomes a `guidance` event with a template sentence. The same output becomes a quiet `heartbeat`, except for a reminder after `REPEAT_MS`.

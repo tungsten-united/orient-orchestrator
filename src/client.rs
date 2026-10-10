@@ -472,7 +472,7 @@ fn accept(app: &App, c: &mut Client, m: &Meta, kind: &str) -> ApiResult<()> {
     Ok(())
 }
 
-/// The multipart parts of an utterance or frame upload, each already checked with `check_part`.
+/// The multipart parts of an input or frame upload, each already checked with `check_part`.
 #[derive(Default)]
 pub struct Parts {
     pub meta: Option<String>,
@@ -549,7 +549,7 @@ pub fn events(app: &App, cref: &ClientRef) -> impl Stream<Item = String> + use<>
     })
 }
 
-pub fn utterance(app: &App, cref: &ClientRef, parts: Parts) -> ApiResult<Value> {
+pub fn input(app: &App, cref: &ClientRef, parts: Parts) -> ApiResult<Value> {
     let m = parse_meta(parts.meta)?;
     let mut c = lock(cref);
     if let Some(r) = c.responses.get(&m.request_id) {
@@ -565,8 +565,8 @@ pub fn utterance(app: &App, cref: &ClientRef, parts: Parts) -> ApiResult<Value> 
         e.retryable = true;
         return Err(e);
     }
-    accept(app, &mut c, &m, "utterance")?;
-    spawn(handle_utterance(
+    accept(app, &mut c, &m, "input")?;
+    spawn(handle_input(
         app.clone(),
         cref.clone(),
         m.clone(),
@@ -693,7 +693,7 @@ pub fn trace(cref: &ClientRef) -> Value {
     json!({"clientId": c.id, "entries": c.entries})
 }
 
-async fn handle_utterance(
+async fn handle_input(
     app: App,
     cref: ClientRef,
     m: Meta,
@@ -712,7 +712,7 @@ async fn handle_utterance(
         Err(e) => {
             let mut c = lock(&cref);
             if c.generation == started_gen {
-                c.log(rid, "utterance", json!({"error": format!("stt: {e}")}));
+                c.log(rid, "input", json!({"error": format!("stt: {e}")}));
                 let data = json!({"code": "upstream_unavailable", "stage": "stt", "text": UNAVAILABLE, "retryable": true});
                 c.halt("error", rid, data);
             }
@@ -735,14 +735,14 @@ async fn handle_utterance(
     if c.generation != started_gen {
         c.log(
             rid,
-            "utterance",
+            "input",
             json!({"transcript": transcript, "dropped": "stale_generation"}),
         );
         return;
     }
     c.log(
         rid,
-        "utterance",
+        "input",
         json!({"transcript": transcript, "command": cmd.name(), "timingsMs": timings}),
     );
     match cmd {

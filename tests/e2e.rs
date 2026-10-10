@@ -238,7 +238,7 @@ async fn sessions_frames_worker_and_stop() {
             .text("meta", meta(rid, generation, seq, now_ms()))
             .part("audio", audio(text));
         h.http
-            .post(url("utterances"))
+            .post(url("inputs"))
             .bearer_auth(token)
             .multipart(form)
             .send()
@@ -282,7 +282,7 @@ async fn sessions_frames_worker_and_stop() {
         .text("transcript", "coffee");
     let r = h
         .http
-        .post(url("utterances"))
+        .post(url("inputs"))
         .bearer_auth(token)
         .multipart(form)
         .send()
@@ -301,7 +301,7 @@ async fn sessions_frames_worker_and_stop() {
         .part("frame", jpeg());
     let r = h
         .http
-        .post(url("utterances"))
+        .post(url("inputs"))
         .bearer_auth(token)
         .multipart(form)
         .send()

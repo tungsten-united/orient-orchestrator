@@ -125,7 +125,7 @@ async fn speech(
         .into_response())
 }
 
-async fn utterance(
+async fn input(
     State(srv): State<Srv>,
     Path(id): Path<String>,
     headers: HeaderMap,
@@ -133,7 +133,7 @@ async fn utterance(
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let cref = get_client(&srv, &id, bearer(&headers))?;
     let parts = read_parts(&srv.app.limits, mp).await?;
-    let r = client::utterance(&srv.app, &cref, parts)?;
+    let r = client::input(&srv.app, &cref, parts)?;
     Ok((StatusCode::ACCEPTED, Json(r)))
 }
 
@@ -209,7 +209,7 @@ pub fn router(app: App) -> Router {
         .route("/v1/clients", post(create_client))
         .route("/v1/clients/{id}/events", get(events))
         .route("/v1/clients/{id}/speech", get(speech))
-        .route("/v1/clients/{id}/utterances", post(utterance))
+        .route("/v1/clients/{id}/inputs", post(input))
         .route("/v1/clients/{id}/frames", post(frames))
         .route("/v1/clients/{id}/stop", post(stop))
         .route("/v1/clients/{id}/retry", post(retry))
