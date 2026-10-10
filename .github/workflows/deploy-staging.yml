@@ -80,6 +80,8 @@ jobs:
           ALLOW_ORIGINS: ${{ vars.ALLOW_ORIGINS || '*' }}
           # Optional: name of the Secret Manager secret holding the ElevenLabs key.
           ELEVENLABS_SECRET: ${{ vars.ELEVENLABS_SECRET }}
+          # Optional: name of the Secret Manager secret holding nav-api's token (nav-api-token).
+          NAV_API_SECRET: ${{ vars.NAV_API_SECRET }}
           ELEVENLABS_VOICE_ID: ${{ vars.ELEVENLABS_VOICE_ID }}
         run: |
           NAV_URL="$REAL_NAV_URL"; FAKE_VARS=""
@@ -88,6 +90,7 @@ jobs:
           if [ -z "$NAV_URL" ]; then echo "::error::fake_nav is off but the staging variable NAV_URL is not set"; exit 1; fi
           SECRETS="TYPESAFE_API_KEY=TYPESAFE_API_KEY:latest"
           if [ -n "$ELEVENLABS_SECRET" ]; then SECRETS="$SECRETS,ELEVENLABS_API_KEY=$ELEVENLABS_SECRET:latest"; fi
+          if [ "$FAKE_NAV" != "true" ] && [ -n "$NAV_API_SECRET" ]; then SECRETS="$SECRETS,NAV_API_TOKEN=$NAV_API_SECRET:latest"; fi
           # Clients live in memory: one instance, CPU kept between requests for the frame worker,
           # and a long timeout so the SSE stream is not cut.
           gcloud run deploy orient-orchestrator-staging --image "$IMAGE" --region "$REGION" \
