@@ -488,6 +488,53 @@ impl Pipeline {
     }
 }
 
+/// Words in a sentence, lowercased and without punctuation.
+fn words(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !(c.is_alphanumeric() || c == '\''))
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Length of the longest run of consecutive words that both lists share.
+fn longest_common_run(a: &[String], b: &[String]) -> usize {
+    let mut best = 0;
+    let mut row = vec![0usize; b.len() + 1];
+    for x in a {
+        let mut diagonal = 0;
+        for (j, y) in b.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = if x == y { diagonal + 1 } else { 0 };
+            best = best.max(row[j + 1]);
+            diagonal = above;
+        }
+    }
+    best
+}
+
+/// Words in a row a transcript must share with a spoken sentence to count as that sentence heard again.
+const ECHO_RUN_WORDS: usize = 5;
+
+/// True when `transcript` is a sentence the app itself just had spoken, picked up by a microphone: the
+/// user's own phone, or another phone in the room. Short sentences must match exactly. Longer ones match
+/// when five words in a row are the same, which a natural answer such as "I would like to go to the
+/// kitchen" does not reach even when it reuses the question's words.
+pub fn is_echo(transcript: &str, spoken: &[String]) -> bool {
+    let heard = words(transcript);
+    if heard.len() < 2 {
+        return false;
+    }
+    spoken.iter().any(|sentence| {
+        let said = words(sentence);
+        match said.len() {
+            0 | 1 => false,
+            2..=4 => heard == said,
+            _ => longest_common_run(&heard, &said) >= ECHO_RUN_WORDS,
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,5 +686,35 @@ mod tests {
             Command::Unclear
         );
         assert_eq!(parse_command(&json!(null), d, 0.5), Command::Unclear);
+    }
+
+    #[test]
+    fn should_recognise_the_app_s_own_sentence_heard_back() {
+        let spoken = vec!["Please hold still, I need a clearer view.".to_string()];
+        let garbled = "Please hold still. I need to clear the UI. Que mas va a estar?";
+        assert!(is_echo(garbled, &spoken));
+        assert!(is_echo("please hold still i need a clearer view", &spoken));
+        let prompt = vec!["Where would you like to go?".to_string()];
+        assert!(is_echo("Where would you like to go?", &prompt));
+    }
+
+    #[test]
+    fn should_not_mistake_a_natural_answer_for_an_echo() {
+        let prompt = vec!["Where would you like to go?".to_string()];
+        assert!(!is_echo("I would like to go to the kitchen", &prompt));
+        assert!(!is_echo("the kitchen", &prompt));
+        let places = "I can take you to the drinks area or the kitchen or the stage.";
+        let reask = vec![format!("I can't guide you there yet. {places} Where would you like to go?")];
+        assert!(!is_echo("I want to go to the kitchen", &reask));
+        assert!(!is_echo("take me to the stage", &reask));
+    }
+
+    #[test]
+    fn should_match_short_sentences_only_exactly() {
+        let spoken = vec!["Turn left.".to_string()];
+        assert!(is_echo("turn left", &spoken));
+        assert!(!is_echo("turn left at the kitchen", &spoken));
+        assert!(!is_echo("kitchen", &spoken));
+        assert!(!is_echo("", &spoken));
     }
 }

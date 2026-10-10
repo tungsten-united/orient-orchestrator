@@ -24,6 +24,10 @@ const UNAVAILABLE: &str = "Guidance is unavailable. Double tap to try again.";
 const MAX_SPEECH_CHARS: usize = 240;
 // ponytail: speech cache capped by entry count, never evicted. Templates and prompts are a small fixed set.
 const SPEECH_CACHE_ENTRIES: usize = 256;
+const RECENT_SPOKEN_ENTRIES: usize = 32;
+/// A recording can hold audio from up to this long before it ended, plus playback delay.
+const ECHO_WINDOW_BEFORE_MS: i64 = 15_000;
+const ECHO_WINDOW_AFTER_MS: i64 = 1_500;
 
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -86,6 +90,7 @@ pub struct AppState {
     pub debug_page: bool,
     pub commit: Option<String>, // GIT_SHA, set by the deploy
     speech_cache: Mutex<HashMap<String, bytes::Bytes>>, // text -> complete MP3
+    recent_spoken: Mutex<VecDeque<(i64, String)>>, // when each phone last asked for a sentence
 }
 
 pub type App = Arc<AppState>;
@@ -102,7 +107,28 @@ impl AppState {
             debug_page: get("DEBUG_PAGE").is_some(),
             commit: get("GIT_SHA"),
             speech_cache: Mutex::default(),
+            recent_spoken: Mutex::default(),
         }
+    }
+
+    /// Remembers a sentence some phone is about to speak, so a microphone hearing it back can be told apart.
+    pub fn note_spoken(&self, text: &str) {
+        let mut recent = self.recent_spoken.lock().unwrap();
+        recent.push_back((now_ms(), text.to_string()));
+        while recent.len() > RECENT_SPOKEN_ENTRIES {
+            recent.pop_front();
+        }
+    }
+
+    /// Sentences any phone had spoken around `at_ms`: what a recording that ended then may have heard.
+    pub fn spoken_near(&self, at_ms: i64) -> Vec<String> {
+        let recent = self.recent_spoken.lock().unwrap();
+        let (from, to) = (at_ms - ECHO_WINDOW_BEFORE_MS, at_ms + ECHO_WINDOW_AFTER_MS);
+        recent
+            .iter()
+            .filter(|(t, _)| (from..=to).contains(t))
+            .map(|(_, text)| text.clone())
+            .collect()
     }
 
     fn destination(&self, id: &str) -> &Destination {
@@ -745,6 +771,7 @@ pub async fn speech(app: &App, text: String) -> ApiResult<Audio> {
             "text: 1 to {MAX_SPEECH_CHARS} characters."
         )));
     }
+    app.note_spoken(&text);
     if let Some(mp3) = app.speech_cache.lock().unwrap().get(&text) {
         return Ok(futures::stream::iter([Ok(mp3.clone())]).boxed());
     }
@@ -814,7 +841,9 @@ async fn handle_input(
     };
     timings.insert("stt".into(), json!(now_ms() - t));
     let t = now_ms();
-    let cmd = if transcript.is_empty() {
+    // The phone heard the app (its own speaker, or another phone's) rather than a person: ask again.
+    let echo = pipeline::is_echo(&transcript, &app.spoken_near(m.captured_at));
+    let cmd = if transcript.is_empty() || echo {
         Command::Empty
     } else {
         app.pipeline
@@ -833,11 +862,12 @@ async fn handle_input(
         );
         return;
     }
-    c.log(
-        rid,
-        "input",
-        json!({"transcript": transcript, "command": cmd.name(), "timingsMs": timings}),
-    );
+    let mut fields = json!({"transcript": transcript, "command": cmd.name()});
+    fields["timingsMs"] = json!(timings);
+    if echo {
+        fields["dropped"] = json!("echo");
+    }
+    c.log(rid, "input", fields);
     match cmd {
         Command::Start(id) => {
             let same_action = c.phase() == "navigating"
