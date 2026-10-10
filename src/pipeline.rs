@@ -385,7 +385,10 @@ impl Pipeline {
                 let command = parse_command(answer, destinations, self.jev_min_confidence);
                 (command, jev_trace(answer))
             }
-            Err(e) => (Command::Unclear, json!({"source": "jev", "error": e.to_string()})),
+            Err(e) => (
+                Command::Unclear,
+                json!({"source": "jev", "error": e.to_string()}),
+            ),
         }
     }
 
@@ -396,7 +399,10 @@ impl Pipeline {
         match self.jev(state, questions, 2000).await {
             Ok(answers) => {
                 let answer = &answers["speak"];
-                (parse_speak(answer, self.jev_min_confidence), jev_trace(answer))
+                (
+                    parse_speak(answer, self.jev_min_confidence),
+                    jev_trace(answer),
+                )
             }
             Err(e) => (true, json!({"source": "jev", "error": e.to_string()})),
         }
