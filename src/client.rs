@@ -558,18 +558,20 @@ fn parse_meta(raw: Option<String>) -> ApiResult<Meta> {
 }
 
 fn ask_again(route: &Route, reason: &str) -> String {
-    let places = route
-        .destinations
-        .iter()
-        .map(|d| d.label.as_str())
-        .collect::<Vec<_>>()
-        .join(" or the ");
-    let first = match reason {
-        "empty" => "I didn't hear anything.",
-        "unsupported" => "I can't guide you there yet.",
-        _ => "Sorry, I didn't understand.",
-    };
-    format!("{first} Where would you like to go? The {places}.")
+    match reason {
+        "empty" => "I didn't hear anything. Where would you like to go?".to_string(),
+        "unsupported" => {
+            // Only here are the options useful: the user asked for somewhere we cannot guide to.
+            let places = route
+                .destinations
+                .iter()
+                .map(|d| d.label.as_str())
+                .collect::<Vec<_>>()
+                .join(" or the ");
+            format!("I can't guide you there yet. I can take you to the {places}. Where would you like to go?")
+        }
+        _ => "Sorry, I didn't understand. Where would you like to go?".to_string(),
+    }
 }
 
 /// The SSE body: a state snapshot first, then every event, with a heartbeat when quiet.
