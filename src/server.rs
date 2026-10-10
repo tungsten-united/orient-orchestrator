@@ -90,11 +90,52 @@ fn debug_page(nav_url: &str) -> Html<String> {
     Html(include_str!("debug.html").replace(default, &format!(r#"id="nav-url" value="{nav_url}""#)))
 }
 
-async fn create_client(State(srv): State<Srv>) -> (StatusCode, Json<Value>) {
+/// The body is optional: `{"mapId": "..."}` picks the place, else the default map (`NAV_MAP_ID`).
+async fn create_client(
+    State(srv): State<Srv>,
+    body: Bytes,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let asked: Value = if body.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&body).map_err(|e| bad_request(format!("body: {e}")))?
+    };
+    let map_id = match &asked["mapId"] {
+        Value::Null => srv.app.pipeline.default_map.clone(),
+        Value::String(id) if is_map_id(id) => id.clone(),
+        _ => return Err(bad_request("mapId: a map id like \"itnig\"")),
+    };
+    let place = match srv.app.pipeline.place(&map_id).await {
+        Ok(Some(place)) => place,
+        Ok(None) => {
+            return Err(api_error(
+                404,
+                "map_not_found",
+                format!("No published map {map_id}."),
+            ));
+        }
+        Err(e) => return Err(client::navigation_unavailable(format!("map {map_id}: {e}"))),
+    };
     let id = uuid::Uuid::new_v4().to_string();
-    let (cref, response) = client::create_client(&srv.app, id.clone());
+    let (cref, response) = client::create_client(&srv.app, id.clone(), place);
     srv.clients.lock().unwrap().insert(id, cref);
-    (StatusCode::CREATED, Json(response))
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+/// Map ids are nav-engine's place slugs; anything else never reaches nav-api's URL.
+fn is_map_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 100
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// The places a phone can choose: the maps published on nav-api.
+async fn maps(State(srv): State<Srv>) -> ApiResult<Json<Value>> {
+    let maps = srv.app.pipeline.maps().await;
+    maps.map(|m| Json(json!(m)))
+        .map_err(|e| client::navigation_unavailable(format!("maps: {e}")))
 }
 
 async fn events(
@@ -249,6 +290,7 @@ pub fn router(app: App) -> Router {
     routes
         .route("/v1/health", get(health))
         .route("/v1/logs", post(logs))
+        .route("/v1/maps", get(maps))
         .route("/v1/clients", post(create_client))
         .route("/v1/clients/{id}/events", get(events))
         .route("/v1/clients/{id}/speech", get(speech))
