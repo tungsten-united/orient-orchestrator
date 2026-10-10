@@ -96,6 +96,7 @@ pub struct Pipeline {
     nav_map: String,
     nav_token: String,
     nav_trust: String,
+    nav_agree: u32,
     pub engine: String,
     eleven: ElevenLabs,
     jev_url: String,
@@ -253,6 +254,7 @@ impl Pipeline {
             nav_map: env("NAV_MAP_ID", "itnig"),
             nav_token: env("NAV_API_TOKEN", ""),
             nav_trust: env("NAV_TRUST", "observed"),
+            nav_agree: env("NAV_AGREE", "3").parse().expect("NAV_AGREE"),
             engine: env("NAV_ENGINE", "nav-engine"),
             eleven: ElevenLabs {
                 url: env("ELEVENLABS_URL", ELEVENLABS_URL),
@@ -460,6 +462,28 @@ impl Pipeline {
             .flatten()
     }
 
+    /// A node still ahead on the route that has been the top unconfirmed candidate `NAV_AGREE` localizations in a row.
+    /// `streak` is the session's (top candidate, consecutive count).
+    pub fn followed(
+        &self,
+        found: &Value,
+        streak: &mut (String, u32),
+        ahead: &[String],
+    ) -> Option<String> {
+        let top = if found["status"] == "lost" {
+            ""
+        } else {
+            found["best"].as_str().unwrap_or("")
+        };
+        if streak.0 == top {
+            streak.1 += 1;
+        } else {
+            *streak = (top.to_string(), 1);
+        }
+        (!top.is_empty() && streak.1 >= self.nav_agree && ahead.iter().any(|n| n == top))
+            .then(|| top.to_string())
+    }
+
     /// Turn a route from `node` into an Output: its first hop, with the turn its first step starts with.
     pub fn validate(&self, route: &Value, node: &str) -> Output {
         let hop = &route["hops"][0];
@@ -531,6 +555,38 @@ mod tests {
             p.located(&json!({"status": "confirmed", "best": null})),
             None
         );
+    }
+
+    #[test]
+    fn should_follow_a_node_ahead_on_the_route_after_agreeing_localizations() {
+        let p = Pipeline::from_vars(&|_| None);
+        let ahead = ["n5".to_string(), "n8".to_string()];
+        let top = |status: &str, best: &str| json!({"status": status, "best": best});
+        let mut streak = (String::new(), 0);
+        assert_eq!(
+            p.followed(&top("uncertain", "n8"), &mut streak, &ahead),
+            None
+        );
+        assert_eq!(
+            p.followed(&top("uncertain", "n8"), &mut streak, &ahead),
+            None
+        );
+        assert_eq!(
+            p.followed(&top("uncertain", "n8"), &mut streak, &ahead),
+            Some("n8".into())
+        );
+        assert_eq!(p.followed(&top("lost", "n8"), &mut streak, &ahead), None);
+        assert_eq!(
+            p.followed(&top("uncertain", "n8"), &mut streak, &ahead),
+            None
+        );
+        let mut streak = (String::new(), 0);
+        for _ in 0..3 {
+            assert_eq!(
+                p.followed(&top("uncertain", "n2"), &mut streak, &ahead),
+                None
+            );
+        }
     }
 
     #[test]

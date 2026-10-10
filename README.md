@@ -135,6 +135,7 @@ To require approval before each release, add required reviewers to the `staging`
 | `ELEVENLABS_VOICE_ID` | unset | Voice for `GET /speech`, picked in S06. Unset: `GET /speech` answers 503 and the phone uses browser TTS |
 | `SPEECH_LANGUAGE` | `en` | Sent to ElevenLabs for both directions, so Scribe skips language detection |
 | `NAV_FRAMES` | `4` | Frames per `localize` call (nav-api takes at most 4) |
+| `NAV_AGREE` | `3` | Localizations in a row that an unconfirmed top candidate must lead to count as reached, when it is a node still ahead on the route |
 | `ROUTE_PATH` | built-in `src/route.json` | Route definition |
 | `MAX_INPUT_AGE_MS` | `3000` | Reject older input |
 | `TRACE_PATH` | unset | Also append the run trace as JSON lines to this file |

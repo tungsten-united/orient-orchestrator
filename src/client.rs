@@ -167,6 +167,8 @@ struct Session {
     last_spoken_at: i64,
     arrived: bool,
     nav_failures: u32,
+    ahead: Vec<String>,
+    streak: (String, u32),
 }
 
 impl Session {
@@ -181,6 +183,8 @@ impl Session {
             last_spoken_at: 0,
             arrived: false,
             nav_failures: 0,
+            ahead: Vec::new(),
+            streak: (String::new(), 0),
         }
     }
 }
@@ -918,7 +922,7 @@ fn nav_failed(cref: &ClientRef, started_gen: i64, rid: Option<&str>, base: &Valu
 /// Where the user is (nav-api `localize`), their next move to the destination (`route`), and whether a
 /// changed move is worth saying (Jev).
 async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
-    let (started_gen, node, dest, frames, previous, last_spoken_at) = {
+    let (started_gen, node, dest, frames, previous, last_spoken_at, ahead, mut streak) = {
         let c = lock(cref);
         let Some(s) = &c.session else { return };
         (
@@ -928,6 +932,8 @@ async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
             s.frames.iter().cloned().collect::<Vec<_>>(),
             s.previous.clone(),
             s.last_spoken_at,
+            s.ahead.clone(),
+            s.streak.clone(),
         )
     };
     let goal = dest.destination_id.as_str();
@@ -949,7 +955,9 @@ async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
         &base,
         json!({"confidence": found["candidates"][0]["score"], "observation": format!("{}: {}", found["status"].as_str().unwrap_or(""), found["reason"].as_str().unwrap_or("")), "localize": found}),
     );
-    let here = app.pipeline.located(&found).or(node);
+    let followed = app.pipeline.followed(&found, &mut streak, &ahead);
+    let here = app.pipeline.located(&found).or(followed).or(node);
+    let mut ahead = Vec::new();
     let output = match here.as_deref() {
         None => Output::wait(None, true),
         Some(n) if n == goal => Output::arrived(n),
@@ -958,6 +966,12 @@ async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
             match app.pipeline.path(n, goal).await {
                 Ok(path) => {
                     timings.insert("route".into(), json!(now_ms() - t));
+                    ahead = path["hops"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|h| h["target"].as_str().map(String::from))
+                        .collect();
                     let output = app.pipeline.validate(&path, n);
                     base = merge(&base, json!({"route": path}));
                     output
@@ -1008,6 +1022,8 @@ async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
         .as_mut()
         .expect("same generation keeps the session");
     s.nav_failures = 0;
+    s.ahead = ahead;
+    s.streak = streak;
     s.node = output.step.clone();
     s.arrived = output.action == "arrived";
     s.previous = Some(output.clone());
