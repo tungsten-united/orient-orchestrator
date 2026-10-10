@@ -1,16 +1,21 @@
 {
   "routeId": "itnig-demo",
-  "startStepId": "start",
+  "startStepId": "n1",
   "destinations": [
     {
-      "destinationId": "counter",
-      "label": "coffee counter",
-      "aliases": ["coffee", "counter", "bar"]
+      "destinationId": "n2",
+      "label": "drinks area",
+      "aliases": ["drinks", "drink", "coffee", "water", "bar", "fridge"]
     },
     {
-      "destinationId": "bathroom",
-      "label": "bathroom",
-      "aliases": ["bathroom", "toilet", "restroom", "wc"]
+      "destinationId": "n7",
+      "label": "kitchen",
+      "aliases": ["kitchen"]
+    },
+    {
+      "destinationId": "n8",
+      "label": "stage",
+      "aliases": ["stage", "talks", "talk", "presentation"]
     }
   ]
 }

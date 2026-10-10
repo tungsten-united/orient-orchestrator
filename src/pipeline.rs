@@ -626,11 +626,11 @@ mod tests {
         let d = &route.destinations;
         assert_eq!(
             match_command("Take me to the coffee", d),
-            Command::Start("counter".into())
+            Command::Start("n2".into())
         );
         assert_eq!(
-            match_command("where is the toilet?", d),
-            Command::Start("bathroom".into())
+            match_command("where is the stage?", d),
+            Command::Start("n8".into())
         );
         assert_eq!(match_command("cancel please", d), Command::Cancel);
         assert_eq!(match_command("barcelona", d), Command::Unsupported);
@@ -642,21 +642,18 @@ mod tests {
         let d = &route.destinations;
         let q = command_question(d);
         let options: Vec<&String> = q["criteria"].as_object().unwrap().keys().collect();
-        assert_eq!(options, ["bathroom", "cancel", "counter", "unsupported"]);
+        assert_eq!(options, ["cancel", "n2", "n7", "n8", "unsupported"]);
         // Answer shape from https://docs.typesafe.ai/introduction/quickstart
         let answer = |choice: &str, confidence: f64| json!({"type": "choice", "choice": choice, "confidence": confidence, "probabilities": {}});
         assert_eq!(
-            parse_command(&answer("counter", 0.8), d, 0.5),
-            Command::Start("counter".into())
+            parse_command(&answer("n2", 0.8), d, 0.5),
+            Command::Start("n2".into())
         );
         assert_eq!(
             parse_command(&answer("cancel", 0.9), d, 0.5),
             Command::Cancel
         );
-        assert_eq!(
-            parse_command(&answer("counter", 0.3), d, 0.5),
-            Command::Unclear
-        );
+        assert_eq!(parse_command(&answer("n2", 0.3), d, 0.5), Command::Unclear);
         assert_eq!(
             parse_command(&answer("kitchen", 0.9), d, 0.5),
             Command::Unclear

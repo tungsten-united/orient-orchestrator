@@ -7,7 +7,7 @@ It implements [`docs/contracts.md`](https://github.com/tungsten-united/project-d
 ## Model
 
 - **Client:** one phone from Start to Stop. It holds the token and the event stream (`/v1/clients/{id}/…`).
-- **Session:** one spoken action, such as going to the counter. The phone sends audio, the orchestrator runs speech-to-text, then Jev picks the action. A different action from the current session starts a new session, with a new `sessionId`, a new generation, an empty frame buffer and no previous output. The same action keeps the current session.
+- **Session:** one spoken action, such as going to the drinks area. The phone sends audio, the orchestrator runs speech-to-text, then Jev picks the action. A different action from the current session starts a new session, with a new `sessionId`, a new generation, an empty frame buffer and no previous output. The same action keeps the current session.
 - **Frame buffer:** each session keeps its last `NAV_FRAMES` (4) frames. nav-api's `localize` gets all of them, oldest first, as repeated `images` parts.
 - **Worker:** one per client. It evaluates the newest frame, validates the navigation answer against the route, and compares the result with the session's previous output. It sends `guidance` only when the output changed (or after `REPEAT_MS` of the same output); otherwise it sends a quiet `heartbeat`.
 
@@ -152,7 +152,7 @@ To require approval before each release, add required reviewers to the `staging`
 - `src/server.rs`, `src/main.rs`: axum HTTP server.
 - `tests/e2e.rs`: end-to-end test over HTTP and SSE, against the native server or any deployment (`E2E_BASE`).
 - `src/pipeline.rs`: model calls (STT, Jev, navigation), path validation, the worker's comparison rule, and sentence templates.
-- `src/route.json`: placeholder Itnig route. Replace it once S01 freezes the real route.
+- `src/route.json`: the Itnig destinations. Each `destinationId` is a node id on nav-api's `itnig` map (n2 Drinks area, n7 Kitchen, n8 Stage).
 
 ## How Jev is used
 

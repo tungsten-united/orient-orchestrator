@@ -113,7 +113,7 @@ async fn harness_with(with_jev: bool) -> Harness {
                     states.lock().unwrap().push(body["state"].clone());
                     return Json(json!({"answers": {"speak": answer("quiet")}}));
                 }
-                Json(json!({"answers": {"command": answer("counter")}}))
+                Json(json!({"answers": {"command": answer("n2")}}))
             }
         }),
     );
@@ -385,7 +385,7 @@ async fn sessions_frames_worker_and_stop() {
     assert_eq!(frames_seen(), 1);
     assert_eq!(
         h.nav.lock().unwrap().route_request,
-        json!({"start": "start", "goal": "counter", "trust": "observed"})
+        json!({"start": "start", "goal": "n2", "trust": "observed"})
     );
     if std::env::var("E2E_BASE").is_err() {
         assert_eq!(
@@ -405,7 +405,7 @@ async fn sessions_frames_worker_and_stop() {
     );
 
     // Replays, old sequences and old captures are rejected without side effects.
-    assert_eq!(say("u1", 2, 0, "bathroom").await.unwrap().status(), 202);
+    assert_eq!(say("u1", 2, 0, "kitchen").await.unwrap().status(), 202);
     assert_eq!(
         post_frame("f0", 2, 0, now_ms()).await.unwrap().status(),
         409
@@ -436,7 +436,7 @@ async fn sessions_frames_worker_and_stop() {
     assert_eq!(frames_seen(), 4);
 
     // A different output is spoken.
-    set_nav("corridor", turn_left("corridor", "counter"), 0);
+    set_nav("corridor", turn_left("corridor", "n2"), 0);
     assert_eq!(
         post_frame("f8", 2, 8, now_ms()).await.unwrap().status(),
         202
@@ -448,7 +448,7 @@ async fn sessions_frames_worker_and_stop() {
             ev["routeStepId"].as_str(),
             ev["nextRouteStepId"].as_str()
         ),
-        (Some("Turn left."), Some("corridor"), Some("counter"))
+        (Some("Turn left."), Some("corridor"), Some("n2"))
     );
     assert_eq!(h.nav.lock().unwrap().previous.as_deref(), Some("start"));
 
@@ -465,7 +465,7 @@ async fn sessions_frames_worker_and_stop() {
 
     // Different action: new session, new generation, empty buffer and no previous output.
     assert_eq!(
-        say("u3", 2, 10, "where is the toilet")
+        say("u3", 2, 10, "take me to the kitchen")
             .await
             .unwrap()
             .status(),
@@ -476,7 +476,7 @@ async fn sessions_frames_worker_and_stop() {
     assert_ne!(session2, session1);
     assert_eq!(
         (ev["generation"].as_i64(), ev["destinationId"].as_str()),
-        (Some(3), Some("bathroom"))
+        (Some(3), Some("n7"))
     );
     assert_eq!(
         post_frame("f11", 2, 11, now_ms()).await.unwrap().status(),
@@ -491,7 +491,7 @@ async fn sessions_frames_worker_and_stop() {
     assert_eq!(h.nav.lock().unwrap().route_request["start"], "corridor");
 
     // Stop while the navigation model is still thinking: the late answer is never emitted.
-    set_nav("bathroom", continue_to("corridor", "bathroom"), 300);
+    set_nav("n7", continue_to("corridor", "n7"), 300);
     assert_eq!(
         post_frame("f13", 3, 13, now_ms()).await.unwrap().status(),
         202

@@ -70,7 +70,7 @@ printf '%s' "$ELEVENLABS_API_KEY" | gcloud secrets versions add ELEVENLABS_API_K
 
 ## Architecture
 
-`src/client.rs` holds the state, the API operations (`input`, `frames`, `stop`, `retry`, `trace`, the SSE `events` stream) and the worker, with no HTTP framework. `src/pipeline.rs` holds the model calls and pure decision rules, and never touches state. `src/server.rs` (axum, run by `src/main.rs`) only parses requests, calls `client`, and writes responses. Behaviour changes go in `client.rs`. `src/route.json` is a placeholder route until S01 freezes the real one.
+`src/client.rs` holds the state, the API operations (`input`, `frames`, `stop`, `retry`, `trace`, the SSE `events` stream) and the worker, with no HTTP framework. `src/pipeline.rs` holds the model calls and pure decision rules, and never touches state. `src/server.rs` (axum, run by `src/main.rs`) only parses requests, calls `client`, and writes responses. Behaviour changes go in `client.rs`. `src/route.json` lists the destinations: node ids on nav-api's `itnig` map.
 
 **Two levels of state.** A `Client` is one phone from Start to Stop. It owns the token, the open SSE streams (`Events`), and the `generation`. A `Session` is one spoken action (one destination). It owns the user's last confirmed map node (carried into the next session), a buffer of the last `NAV_FRAMES` (4) frames, and the previous navigation output. When speech-to-text plus Jev yields a different destination, `start_session` replaces the session. The same destination keeps it.
 
