@@ -1029,10 +1029,11 @@ enum Move {
 }
 
 /// One localization through the navigation loop (contracts.md section 2): locating, a node with `k` of the last
-/// `n` votes (or a `confirmed` result) is where the user is; following, `k` votes for the hop's target reach it.
-/// Two things start over: `k` votes for another node (only `confirmed` results cast them, `follow_vote`), or no result
-/// pointing at the hop for `lost_ms`: each one `lost`, or led by a node that is neither the hop's source nor its
-/// target. Brief noise doesn't drop the route, a long stretch of it does. Only the hop's target can be reached.
+/// `n` votes (or a `confirmed` result) is where the user is; following, `k` votes for one node ahead on the route (the
+/// hop's target or one further on) reach it, and the route goes on from there. Two things start over: `k` votes for a
+/// node off the route (only `confirmed` results cast them, `follow_vote`), or no result pointing at the route for
+/// `lost_ms`: each one `lost`, or led by a node that is neither the hop's source, its target nor a node ahead voting.
+/// Brief noise doesn't drop the route, a long stretch of it does.
 /// `steps` and `at` are the newest frame's stepCount and capturedAt. Returns the vote, how many of the last `n` agree
 /// with it, and the move.
 fn advance(
@@ -1057,25 +1058,31 @@ fn advance(
         nav.votes.clear();
         return (vote, count, Move::Located(n));
     };
-    let hop = &path[nav.hop];
-    let (source, target) = (
-        hop["source"].as_str().unwrap_or("").to_string(),
-        hop["target"].as_str().unwrap_or("").to_string(),
-    );
-    let last = nav.hop + 1 >= path.len();
-    let vote = pipeline::follow_vote(found, &source, &target, cfg.margin);
+    let node_of = |hop: &Value, end: &str| hop[end].as_str().unwrap_or("").to_string();
+    let source = node_of(&path[nav.hop], "source");
+    let ahead: Vec<String> = path[nav.hop..]
+        .iter()
+        .map(|h| node_of(h, "target"))
+        .collect();
+    let vote = pipeline::follow_vote(found, &source, &ahead, cfg.margin);
     let count = pipeline::tally(&mut nav.votes, vote.clone(), cfg.n);
     let best = found["best"].as_str().unwrap_or("");
-    let on_hop = found["status"] != "lost" && (best == source || best == target);
-    nav.off_hop_since = (!on_hop).then(|| nav.off_hop_since.unwrap_or(at));
-    if vote == Vote::Target && count >= cfg.k {
-        (nav.node, nav.node_steps) = (Some(target.clone()), steps);
-        (nav.hop, nav.off_hop_since) = (nav.hop + 1, None);
+    // Pointing at the route: the hop's source or target leads (not lost), or a node ahead votes.
+    let on_route = (found["status"] != "lost" && (best == source || best == ahead[0]))
+        || matches!(&vote, Vote::At(_));
+    nav.off_hop_since = (!on_route).then(|| nav.off_hop_since.unwrap_or(at));
+    if let Vote::At(n) = &vote
+        && count >= cfg.k
+    {
+        // Reached n: the route goes on from there, past any node the camera missed.
+        let reached = nav.hop + ahead.iter().position(|a| a == n).unwrap_or(0);
+        (nav.node, nav.node_steps) = (Some(n.clone()), steps);
+        (nav.hop, nav.off_hop_since) = (reached + 1, None);
         nav.votes.clear();
-        if last {
+        if nav.hop >= path.len() {
             nav.path = None;
         }
-        return (vote, count, Move::Reached(target));
+        return (vote.clone(), count, Move::Reached(n.clone()));
     }
     let off_hop_for = nav.off_hop_since.map_or(0, |t| at - t);
     if (vote == Vote::Elsewhere && count >= cfg.k) || off_hop_for >= cfg.lost_ms {
@@ -1335,7 +1342,7 @@ mod tests {
     }
 
     #[test]
-    fn should_reach_only_the_hop_s_target_and_start_over_when_lost() {
+    fn should_reach_the_target_or_a_node_further_on_and_start_over_off_the_route() {
         let mut nav = Nav {
             node: Some("n1".into()),
             node_steps: Some(4),
@@ -1372,25 +1379,63 @@ mod tests {
         assert_eq!(mv, Move::Reached("n2".into()));
         assert_eq!((nav.hop, nav.node_steps), (1, Some(11)));
         assert_eq!(nav.ask().expected.as_deref(), Some("n3"));
-        // the goal seen from afar, even confirmed, doesn't skip n3: it's elsewhere, and three of those start over
+        // the goal leading while nav-api says the user hasn't walked that far (seen from afar): no move
+        let mut seen_from_afar = found("uncertain", "n4", 0.2);
+        seen_from_afar["candidates"][0]["plausible"] = json!(false);
+        for _ in 0..4 {
+            let (vote, _, mv) = advance(&mut nav, &seen_from_afar, None, (None, 0), &CFG);
+            assert_eq!((vote, mv), (Vote::Abstain, Move::Stay));
+        }
+        // leading in 3 of the last 4 once they could have walked there: the user is past n3, which the camera
+        // missed, at the goal, and the route ends there
         for _ in 0..2 {
+            assert_eq!(
+                advance(
+                    &mut nav,
+                    &found("uncertain", "n4", 0.2),
+                    None,
+                    (None, 0),
+                    &CFG
+                )
+                .2,
+                Move::Stay
+            );
+        }
+        let (vote, _, mv) = advance(
+            &mut nav,
+            &found("uncertain", "n4", 0.2),
+            None,
+            (Some(30), 0),
+            &CFG,
+        );
+        assert_eq!(
+            (vote, mv),
+            (Vote::At("n4".into()), Move::Reached("n4".into()))
+        );
+        assert!(nav.path.is_none() && nav.votes.is_empty());
+        assert_eq!(
+            (nav.node.as_deref(), nav.node_steps),
+            (Some("n4"), Some(30))
+        );
+
+        // a node off the route, confirmed three times, starts over from the last node reached
+        let mut nav = Nav {
+            node: Some("n2".into()),
+            node_steps: Some(11),
+            path: Some(path()),
+            hop: 1,
+            ..Nav::default()
+        };
+        for want in [Move::Stay, Move::Stay, Move::Lost] {
             let (vote, _, mv) = advance(
                 &mut nav,
-                &found("confirmed", "n4", 0.2),
-                Some("n4".into()),
+                &found("confirmed", "n9", 0.2),
+                Some("n9".into()),
                 (None, 0),
                 &CFG,
             );
-            assert_eq!((vote, mv), (Vote::Elsewhere, Move::Stay));
+            assert_eq!((vote, mv), (Vote::Elsewhere, want));
         }
-        let (_, _, mv) = advance(
-            &mut nav,
-            &found("confirmed", "n4", 0.2),
-            Some("n4".into()),
-            (None, 0),
-            &CFG,
-        );
-        assert_eq!(mv, Move::Lost);
         assert!(nav.path.is_none() && nav.votes.is_empty());
         let ask = nav.ask();
         assert_eq!(
@@ -1485,6 +1530,59 @@ mod tests {
         }
         // Bar kiosk, Orange shop, Playground, Body Shop junction, Rituals shop: back towards the entrance.
         assert_eq!(walked, ["n13", "n10", "n9", "n8", "n5"]);
+    }
+
+    /// Itnig, 2026-10-10 (tests/fixtures/itnig-following-restarts.json): every live hop that ended because another
+    /// node won three of the last four results, which dropped the route and started locating again ("Please hold
+    /// still"). Replayed with nav-api's live answers up to that restart: where that node was further on the route
+    /// (8 hops: mostly Right-side tables, which the camera rarely recognises, walked past to Corridor end) the user
+    /// now reaches it and keeps the route; off the route or behind it (7 hops) the user never moves along the route.
+    #[test]
+    fn should_move_on_to_a_node_further_on_where_live_dropped_the_route() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/itnig-following-restarts.json"
+        ))
+        .unwrap();
+        let cfg = Pipeline::from_vars(&|_| None).nav_loop;
+        let mut reached = 0;
+        for h in fixture["hops"].as_array().unwrap() {
+            let route: Vec<&str> = h["route"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|n| n.as_str().unwrap())
+                .collect();
+            let hop = h["hop"].as_u64().unwrap() as usize;
+            let mut nav = Nav {
+                node: Some(route[hop].into()),
+                path: Some(
+                    route
+                        .windows(2)
+                        .map(|w| json!({"source": w[0], "target": w[1]}))
+                        .collect(),
+                ),
+                hop,
+                ..Nav::default()
+            };
+            let frames = h["frames"].as_array().unwrap();
+            let mv = frames
+                .iter()
+                .map(|f| advance(&mut nav, f, None, (None, f["at"].as_i64().unwrap()), &cfg).2)
+                .find(|mv| *mv != Move::Stay);
+            let label = format!("{} hop {}: {}", h["session"], hop, h["live"]);
+            if h["where"] == "further on the route" {
+                assert_eq!(
+                    mv,
+                    Some(Move::Reached(h["elsewhere"].as_str().unwrap().into())),
+                    "{label}"
+                );
+                assert_eq!(nav.node.as_deref(), h["elsewhere"].as_str(), "{label}");
+                reached += 1;
+            } else {
+                assert!(!matches!(mv, Some(Move::Reached(_))), "{label}: {mv:?}");
+            }
+        }
+        assert_eq!(reached, 8);
     }
 
     #[test]
