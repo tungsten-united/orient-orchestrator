@@ -121,7 +121,7 @@ To require approval before each release, add required reviewers to the `staging`
 | `REPEAT_MS` | `7000` | The worker repeats unchanged guidance after this |
 | `TRACE_PATH` | unset | Also append the run trace as JSON lines to this file |
 | `ALLOW_ORIGINS` | `*` | CORS origins, comma separated |
-| `DEBUG_PAGE` | unset | Serve the debug page at `/debug` (local runs and staging) |
+| `DEBUG_PAGE` | unset | Serve the debug page at `/debug` and stream every trace entry as a `log` SSE event (local runs and staging) |
 | `GIT_SHA` | unset | Commit shown by `/v1/health` and stamped on every trace entry; set by the staging deploy |
 | `TRACE_STDOUT` | unset | Also print every trace entry as one JSON line (stored by Cloud Logging on Cloud Run); on in staging |
 
