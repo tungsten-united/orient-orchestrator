@@ -753,7 +753,11 @@ async fn sessions_frames_worker_and_stop() {
         .text()
         .await
         .unwrap();
-    assert!(t.contains("\"framesSent\":1") && t.contains("vote target") && !t.contains(token));
+    assert!(
+        t.contains("\"framesSent\":1")
+            && t.contains("of the last 4) → reached")
+            && !t.contains(token)
+    );
 }
 
 /// The server alone, with a fake nav-api that only serves the maps (clients need their map's places).
@@ -1352,4 +1356,65 @@ async fn should_guide_back_over_the_walked_connections_on_the_live_walk_back() {
     let first_hop = &walk_back()["routes"]["n13"]["any"]["hops"][0];
     assert_eq!(spoken[0], "Please hold still, I need a clearer view.");
     assert_eq!(Some(spoken[1].as_str()), first_hop["instruction"].as_str());
+}
+
+/// The camera misses a node on the way (Itnig, 2026-10-10: Right-side tables, walked past to Corridor end): the next
+/// one leading, with nav-api agreeing the user could have walked there, is where they are. The route goes on from
+/// there, with no "Please hold still" and no new route; hop by hop only, this dropped the route and located again.
+#[tokio::test]
+async fn should_move_on_past_a_node_the_camera_missed() {
+    let h = harness().await;
+    let c: Value = h
+        .http
+        .post(format!("{}/v1/clients", h.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let (cid, token) = (
+        c["clientId"].as_str().unwrap(),
+        c["clientToken"].as_str().unwrap(),
+    );
+    let url = |p: &str| format!("{}/v1/clients/{cid}/{p}", h.base);
+    let mut rx = Events::open(&h.http, format!("{}?token={token}", url("events"))).await;
+    rx.next().await;
+    {
+        let mut n = h.nav.lock().unwrap();
+        n.found = confirmed("start");
+        n.route = path(&[
+            ("start", "corridor", "straight", None),
+            ("corridor", "n2", "turn_left", None),
+        ]);
+    }
+    let form = Form::new()
+        .text("meta", meta("u1", 1, 0, now_ms()))
+        .part("audio", audio("take me to the drinks area"))
+        .part("frame", jpeg());
+    let r = h
+        .http
+        .post(url("inputs"))
+        .bearer_auth(token)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 202);
+    assert_eq!(rx.next().await["phase"], "navigating");
+    assert_eq!(rx.next().await["text"], "Keep going straight.");
+
+    // The corridor is never recognised; the drinks area leads, not confirmed, and could have been walked to.
+    h.nav.lock().unwrap().found = json!({"status": "uncertain", "reason": "best score 0.41 < 0.45", "best": "n2",
+        "margin": 0.08, "candidates": [{"node": "n2", "score": 0.41, "plausible": true}]});
+    let (ev, _, sent) = frames_until_news(&h, &mut rx, &url("frames"), token, 2, 1).await;
+    assert_eq!(
+        (ev["action"].as_str(), ev["text"].as_str()),
+        (
+            Some("arrived"),
+            Some("You have arrived at the drinks area.")
+        )
+    );
+    assert_eq!(sent, 3); // three of the last four
+    assert_eq!(h.nav.lock().unwrap().route_calls, 1);
 }

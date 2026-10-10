@@ -133,11 +133,9 @@ pub struct NavLoop {
 /// One localization's vote in the navigation loop.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Vote {
-    /// Locating: the user seems to be at this node.
+    /// The user seems to be at this node: locating, any node; following, the hop's target or a node further on.
     At(String),
-    /// Following: the hop's target leads.
-    Target,
-    /// Following: a node that is neither the hop's source nor its target leads.
+    /// Following: a node off the route is confirmed.
     Elsewhere,
     Abstain,
 }
@@ -147,7 +145,6 @@ impl Vote {
     pub fn name(&self) -> String {
         match self {
             Vote::At(node) => node.clone(),
-            Vote::Target => "target".into(),
             Vote::Elsewhere => "elsewhere".into(),
             Vote::Abstain => "none".into(),
         }
@@ -195,15 +192,23 @@ pub fn locate_vote(found: &Value, margin: f64, lost_margin: f64) -> Vote {
     leader(found, margin, Some(lost_margin)).map_or(Vote::Abstain, |n| Vote::At(n.into()))
 }
 
-/// Following the hop `source -> target`: has the user reached the target, or are they somewhere else? Only a
-/// `confirmed` result says elsewhere: nav-api confirms a node only next to the hop's source, or within what the user
-/// walked. An `uncertain` one led by another node is mostly noise (Itnig, 2026-10-10: 53 of 70 elsewhere votes were
-/// uncertain, 24 of them a node nav-api called "not next to the last confirmed node", and they caused 15 of the 20
-/// restarts, each one "Please hold still" to a user who was walking). The target still counts from any lead, and a
-/// long stretch of other nodes leading starts over too (`NAV_LOST_MS`, `advance` in client.rs).
-pub fn follow_vote(found: &Value, source: &str, target: &str, margin: f64) -> Vote {
+/// Following from `source`, with `ahead` the route's nodes still to reach (the hop's target first): where does the
+/// result put the user?
+///
+/// - At a node ahead on the route, when it leads: the hop's target, or one further on, because the user walked past a
+///   node the camera missed. Hop by hop only, a missed node meant starting over: live, 8 of the 15 restarts where
+///   another node won were a node further on, and locating again put the user there in 6, after "Please hold still"
+///   (Itnig, 2026-10-10; tests/fixtures/itnig-following-restarts.json). Since `elsewhere` needs confirmed results, the
+///   same walk waits `NAV_LOST_MS` first. nav-api's walked-distance gate (`plausible`, `leader`) is what keeps a node
+///   seen from afar from counting before the user walked that far. Without it (no motion, session a08f7beb), counting
+///   the nodes ahead declared arrival at the stage early; the phone now always sends its motion.
+/// - Elsewhere: a node off the route, confirmed. nav-api confirms a node only next to the hop's source, or within
+///   what the user walked; an `uncertain` one is mostly noise (Itnig, 2026-10-10: 53 of 70 elsewhere votes were
+///   uncertain, and they caused 15 of the 20 restarts). A long stretch of other nodes leading starts over too
+///   (`NAV_LOST_MS`, `advance` in client.rs).
+pub fn follow_vote(found: &Value, source: &str, ahead: &[String], margin: f64) -> Vote {
     match leader(found, margin, None) {
-        Some(n) if n == target => Vote::Target,
+        Some(n) if ahead.iter().any(|a| a == n) => Vote::At(n.into()),
         Some(n) if n != source && found["status"] == "confirmed" => Vote::Elsewhere,
         _ => Vote::Abstain,
     }
@@ -831,8 +836,10 @@ mod tests {
             locate_vote(&found("lost", "n4", 0.07), 0.04, 0.06),
             Vote::At("n4".into())
         );
+        let ahead = |nodes: &[&str]| nodes.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        let route = ahead(&["n5", "n6", "n8"]); // following n4 -> n5, then n6, then the goal n8
         assert_eq!(
-            follow_vote(&found("lost", "n5", 0.2), "n4", "n5", 0.04),
+            follow_vote(&found("lost", "n5", 0.2), "n4", &route, 0.04),
             Vote::Abstain
         );
         assert_eq!(
@@ -842,22 +849,39 @@ mod tests {
         let mut too_far = found("uncertain", "n5", 0.1);
         too_far["candidates"][0]["plausible"] = json!(false);
         assert_eq!(locate_vote(&too_far, 0.04, 0.06), Vote::Abstain);
-        assert_eq!(follow_vote(&too_far, "n4", "n5", 0.04), Vote::Abstain);
+        assert_eq!(follow_vote(&too_far, "n4", &route, 0.04), Vote::Abstain);
+        // the hop's target from any lead; still at the source, no vote
         assert_eq!(
-            follow_vote(&found("uncertain", "n5", 0.05), "n4", "n5", 0.04),
-            Vote::Target
+            follow_vote(&found("uncertain", "n5", 0.05), "n4", &route, 0.04),
+            Vote::At("n5".into())
         );
         assert_eq!(
-            follow_vote(&found("confirmed", "n4", 0.1), "n4", "n5", 0.04),
+            follow_vote(&found("confirmed", "n4", 0.1), "n4", &route, 0.04),
             Vote::Abstain
         );
-        // another node confirmed is elsewhere, the goal seen from afar too; merely leading, it says nothing
+        // further on the route, like the target: the user walked past a node the camera missed
         assert_eq!(
-            follow_vote(&found("confirmed", "n8", 0.1), "n4", "n5", 0.04),
+            follow_vote(&found("confirmed", "n6", 0.1), "n4", &route, 0.04),
+            Vote::At("n6".into())
+        );
+        assert_eq!(
+            follow_vote(&found("uncertain", "n8", 0.1), "n4", &route, 0.04),
+            Vote::At("n8".into())
+        );
+        // ... unless nav-api says the user hasn't walked that far: the goal seen from afar
+        let mut seen_from_afar = found("uncertain", "n8", 0.1);
+        seen_from_afar["candidates"][0]["plausible"] = json!(false);
+        assert_eq!(
+            follow_vote(&seen_from_afar, "n4", &route, 0.04),
+            Vote::Abstain
+        );
+        // off the route: confirmed, elsewhere; merely leading, nothing
+        assert_eq!(
+            follow_vote(&found("confirmed", "n9", 0.1), "n4", &route, 0.04),
             Vote::Elsewhere
         );
         assert_eq!(
-            follow_vote(&found("uncertain", "n8", 0.1), "n4", "n5", 0.04),
+            follow_vote(&found("uncertain", "n9", 0.1), "n4", &route, 0.04),
             Vote::Abstain
         );
     }
@@ -865,11 +889,12 @@ mod tests {
     #[test]
     fn should_count_votes_among_the_last_n() {
         let mut votes = VecDeque::new();
-        assert_eq!(tally(&mut votes, Vote::Target, 4), 1);
+        let n2 = || Vote::At("n2".into());
+        assert_eq!(tally(&mut votes, n2(), 4), 1);
         assert_eq!(tally(&mut votes, Vote::Abstain, 4), 0);
-        assert_eq!(tally(&mut votes, Vote::Target, 4), 2);
+        assert_eq!(tally(&mut votes, n2(), 4), 2);
         assert_eq!(tally(&mut votes, Vote::Elsewhere, 4), 1);
-        assert_eq!(tally(&mut votes, Vote::Target, 4), 2); // the first Target fell out of the window
+        assert_eq!(tally(&mut votes, n2(), 4), 2); // the first n2 fell out of the window
         assert_eq!(votes.len(), 4);
     }
 

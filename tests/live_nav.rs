@@ -62,14 +62,15 @@ async fn should_locate_and_route_on_the_live_nav_api() {
         found["walked_m"].is_number(),
         "the motion reached nav-api: {found}"
     );
-    let vote = follow_vote(
-        &found,
-        "n1",
-        hop["target"].as_str().unwrap(),
-        p.nav_loop.margin,
-    );
-    assert!(matches!(
-        vote,
-        Vote::Target | Vote::Elsewhere | Vote::Abstain
-    ));
+    let ahead: Vec<String> = route["hops"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["target"].as_str().unwrap().to_string())
+        .collect();
+    let vote = follow_vote(&found, "n1", &ahead, p.nav_loop.margin);
+    assert!(match &vote {
+        Vote::At(n) => ahead.contains(n),
+        _ => true,
+    });
 }
