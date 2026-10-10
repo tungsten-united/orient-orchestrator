@@ -704,7 +704,9 @@ mod tests {
         assert!(!is_echo("I would like to go to the kitchen", &prompt));
         assert!(!is_echo("the kitchen", &prompt));
         let places = "I can take you to the drinks area or the kitchen or the stage.";
-        let reask = vec![format!("I can't guide you there yet. {places} Where would you like to go?")];
+        let reask = vec![format!(
+            "I can't guide you there yet. {places} Where would you like to go?"
+        )];
         assert!(!is_echo("I want to go to the kitchen", &reask));
         assert!(!is_echo("take me to the stage", &reask));
     }
