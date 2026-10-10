@@ -95,6 +95,17 @@ gcloud logging read 'resource.labels.service_name="orient-orchestrator-staging" 
 
 Logs are kept 30 days.
 
+The phone also posts debug lines to `POST /v1/logs` (no token, because a denied permission happens before a client exists). They appear as `kind="client_log"`, with `deviceId`, `clientId`, `event`, `level` and `detail`, and are capped at 120 batches a minute for the whole server:
+
+```bash
+# Phone-side failures, newest first
+gcloud logging read 'resource.labels.service_name="orient-orchestrator-staging" AND jsonPayload.kind="client_log"' \
+  --project tungsten-united --freshness 1d --format 'value(timestamp,jsonPayload.level,jsonPayload.event,jsonPayload.detail)'
+# One phone, both sides
+gcloud logging read 'resource.labels.service_name="orient-orchestrator-staging" AND (jsonPayload.clientId="<id>" OR jsonPayload.deviceId="<id>")' \
+  --project tungsten-united --order asc --format 'value(timestamp,jsonPayload.kind,jsonPayload.event,jsonPayload.detail)'
+```
+
 To require approval before each release, add required reviewers to the `staging` environment. If your organization blocks public services (`allUsers`), `--allow-unauthenticated` fails; ask an org admin, or put the services behind IAP.
 
 ## Configuration

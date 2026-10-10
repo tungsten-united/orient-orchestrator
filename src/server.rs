@@ -23,7 +23,12 @@ struct Server {
     app: App,
     // ponytail: in-memory clients in one process, never expired. Fine for one demo phone; add a store if we scale out.
     clients: Mutex<HashMap<String, ClientRef>>,
+    // Start of the current minute and the log batches received in it. Debug logs are unauthenticated,
+    // because the failures worth seeing happen before a client exists, so they get a global cap.
+    log_window: Mutex<(i64, u32)>,
 }
+
+const LOG_BATCHES_PER_MINUTE: u32 = 120;
 
 type Srv = Arc<Server>;
 
@@ -169,6 +174,25 @@ async fn retry(
     Ok(Json(client::retry(&cref, &body)?))
 }
 
+/// Phone debug logs. No token: a denied permission happens before `POST /v1/clients`.
+async fn logs(State(srv): State<Srv>, body: Bytes) -> ApiResult<StatusCode> {
+    {
+        let mut window = srv.log_window.lock().unwrap();
+        let now = client::now_ms();
+        if now - window.0 >= 60_000 {
+            *window = (now, 0);
+        }
+        window.1 += 1;
+        if window.1 > LOG_BATCHES_PER_MINUTE {
+            return Err(api_error(429, "rate_limited", "Too many log batches."));
+        }
+    }
+    for line in client::client_logs(&srv.app, &body)? {
+        println!("{line}"); // one JSON line: Cloud Logging stores it as a structured entry
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn trace(
     State(srv): State<Srv>,
     Path(id): Path<String>,
@@ -203,9 +227,11 @@ pub fn router(app: App) -> Router {
     let srv = Arc::new(Server {
         app,
         clients: Mutex::default(),
+        log_window: Mutex::default(),
     });
     routes
         .route("/v1/health", get(health))
+        .route("/v1/logs", post(logs))
         .route("/v1/clients", post(create_client))
         .route("/v1/clients/{id}/events", get(events))
         .route("/v1/clients/{id}/speech", get(speech))
