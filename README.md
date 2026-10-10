@@ -162,6 +162,10 @@ To require approval before each release, add required reviewers to the `staging`
 - **Worker:** compares outputs in code. If that proves too rigid, this is a natural Noul question ("should the user be told something now?").
 - **Sentences:** fixed templates, because Jev doesn't write sentences.
 
+## Echo guard
+
+A microphone can hear the app instead of a person: the user's own phone, or another phone in the room. Every sentence any phone asks `GET /speech` for is remembered for a short time. A transcript that repeats one of them (five words in a row, or the whole sentence when it is four words or fewer) is treated as an empty input: the user is asked again, and the trace entry has `dropped: "echo"`. It looks only at sentences spoken in the 15 seconds before the recording ended.
+
 ## Known limits
 
 - The Jev call has not been run against the live API yet. The request and answer shapes come from the TypeSafe quickstart, and the parsing is unit-tested against them.
