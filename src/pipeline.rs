@@ -100,6 +100,16 @@ impl Output {
         }
     }
 
+    /// Located, but nav-api has no route from here: said once, not "hold still", which would blame the camera.
+    pub fn no_route(step: &str, destination_label: &str) -> Self {
+        Output {
+            instruction: Some(format!(
+                "I can't find a way to the {destination_label} from here."
+            )),
+            ..Output::wait(Some(step), false)
+        }
+    }
+
     pub fn arrived(step: &str) -> Self {
         Output {
             action: "arrived".into(),
@@ -381,7 +391,7 @@ impl Pipeline {
             nav_url: env("NAV_URL", "http://localhost:8001"),
             default_map: env("NAV_MAP_ID", "itnig"),
             nav_token: env("NAV_API_TOKEN", ""),
-            nav_trust: env("NAV_TRUST", "observed"),
+            nav_trust: env("NAV_TRUST", "any"),
             nav_loop: NavLoop {
                 burst: env("NAV_BURST", "1").parse().expect("NAV_BURST"),
                 k: env("NAV_VOTE_K", "3").parse().expect("NAV_VOTE_K"),
@@ -921,6 +931,25 @@ mod tests {
             Some("Go through the glass door.".into())
         );
         assert_eq!(fit_instruction(&"a".repeat(241)), None);
+    }
+
+    /// Itnig, 2026-10-10 (session 9a90bd61): nav-engine's cleaner joined two hops into one, Drinks area -> Corridor
+    /// end, with this 263-character instruction. The phone said only its first sentence, the user stopped at the
+    /// tables, 4 m short, and the hop never confirmed. nav-engine no longer joins hops and flags any instruction over
+    /// 240 characters; this keeps the phone's side of that contract on record.
+    #[test]
+    fn should_say_only_what_fits_of_the_live_263_character_instruction() {
+        let live = "Bear right slightly and keep down the narrow aisle for about 3 metres until a group of tables is \
+                    on your right. Then, bear right and continue about 4 metres down the aisle until it opens out into \
+                    a wider space; a fire extinguisher hangs on the wall on your right.";
+        assert_eq!(live.chars().count(), 263);
+        assert_eq!(
+            fit_instruction(live).as_deref(),
+            Some(
+                "Bear right slightly and keep down the narrow aisle for about 3 metres until a group of tables \
+                 is on your right."
+            )
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //!   E2E_BASE=https://… cargo test --test e2e   # fakes on :8101 (nav) and :8102 (ElevenLabs);
 //!                                             # point NAV_URL and ELEVENLABS_URL there
 
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -34,8 +35,16 @@ struct FakeNav {
     route_request: Value,
     route_calls: usize,
     auth: Option<String>,
-    caller: Value, // the X-*-Id headers of the last localize
-    map: String,   // the map of the last localize
+    caller: Value,                  // the X-*-Id headers of the last localize
+    map: String,                    // the map of the last localize
+    script: VecDeque<Value>,        // localize answers to give in order, before `found`
+    routes: HashMap<String, Value>, // "start/trust" -> the route answer, before `route`
+    route_starts: Vec<String>,      // the start of every route request, in order
+}
+
+/// The walk back on Glories Basement, 2026-10-10: nav-api's live answers, per session (see its `about`).
+fn walk_back() -> Value {
+    serde_json::from_str(include_str!("fixtures/glories-walk-back.json")).unwrap()
 }
 
 /// The maps the fake nav-api publishes, as `GET /maps/{map_id}` serves them (the fields the orchestrator reads).
@@ -43,9 +52,7 @@ fn fake_map(map_id: &str) -> Option<Value> {
     let nodes = match map_id {
         "itnig" => json!([{"id": "n2", "name": "drinks area"}, {"id": "n7", "name": "kitchen"},
                           {"id": "n8", "name": "stage"}]),
-        "glories-basement" => {
-            json!([{"id": "n1", "name": "Main entrance"}, {"id": "n4", "name": "Ticket machines"}])
-        }
+        "glories-basement" => walk_back()["map"]["nodes"].clone(),
         _ => return None,
     };
     Some(json!({"map_id": map_id, "place": map_id, "nodes": nodes, "edges": []}))
@@ -78,6 +85,11 @@ async fn serve(router: Router, port: u16) -> String {
 
 /// `with_jev`: a fake TypeSafe that picks the drinks area and keeps every changed direction quiet.
 async fn harness_with(with_jev: bool) -> Harness {
+    harness_vars(with_jev, &[]).await
+}
+
+/// `extra`: more settings for the in-process server.
+async fn harness_vars(with_jev: bool, extra: &[(&'static str, &str)]) -> Harness {
     let nav = Arc::new(Mutex::new(FakeNav::default()));
     let fake = nav.clone();
     let fake_nav = Router::new()
@@ -133,7 +145,8 @@ async fn harness_with(with_jev: bool) -> Harness {
                         .get("authorization")
                         .and_then(|v| v.to_str().ok())
                         .map(String::from);
-                    (n.found.clone(), n.delay_ms)
+                    let answer = n.script.pop_front().unwrap_or_else(|| n.found.clone());
+                    (answer, n.delay_ms)
                 };
                 tokio::time::sleep(Duration::from_millis(delay)).await;
                 Json(answer)
@@ -147,9 +160,17 @@ async fn harness_with(with_jev: bool) -> Harness {
             let fake = fake.clone();
             async move {
                 let mut n = fake.lock().unwrap();
+                let start = req["start"].as_str().unwrap_or("").to_string();
+                let key = format!("{start}/{}", req["trust"].as_str().unwrap_or(""));
                 n.route_request = req;
                 n.route_calls += 1;
-                Json(n.route.clone())
+                n.route_starts.push(start);
+                Json(
+                    n.routes
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or_else(|| n.route.clone()),
+                )
             }
         }),
     );
@@ -238,6 +259,7 @@ async fn harness_with(with_jev: bool) -> Harness {
                 ("ELEVENLABS_VOICE_ID", "test-voice".into()),
                 ("NAV_API_TOKEN", "nav-token".into()),
             ];
+            vars.extend(extra.iter().map(|(k, v)| (*k, v.to_string())));
             if with_jev {
                 vars.push(("JEV_URL", format!("{}/jev", serve(fake_jev, 0).await)));
                 vars.push(("TYPESAFE_API_KEY", "test-jev-key".into()));
@@ -491,7 +513,7 @@ async fn sessions_frames_worker_and_stop() {
     assert_eq!(frames_seen(), 1);
     assert_eq!(
         h.nav.lock().unwrap().route_request,
-        json!({"start": "start", "goal": "n2", "trust": "observed"})
+        json!({"start": "start", "goal": "n2", "trust": "any"})
     );
     assert_eq!(route_calls(), 1);
     {
@@ -1068,11 +1090,18 @@ async fn should_guide_on_the_map_the_phone_chose() {
         .json()
         .await
         .unwrap();
+    let nodes = walk_back()["map"]["nodes"].clone();
+    let places: Vec<Value> = nodes
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| json!({"destinationId": n["id"], "label": n["name"]}))
+        .collect();
     assert_eq!(
         c["route"],
-        json!({"routeId": "glories-basement", "destinations": [
-            {"destinationId": "n1", "label": "Main entrance"}, {"destinationId": "n4", "label": "Ticket machines"}]})
+        json!({"routeId": "glories-basement", "destinations": places})
     );
+    assert_eq!(places.len(), 16);
     let (cid, token) = (
         c["clientId"].as_str().unwrap(),
         c["clientToken"].as_str().unwrap(),
@@ -1087,12 +1116,12 @@ async fn should_guide_on_the_map_the_phone_chose() {
             "n1",
             "n4",
             "turn_right",
-            Some("Turn right and walk to the ticket machines."),
+            Some("Turn right and walk to the second escalators."),
         )]);
     }
     let form = Form::new()
         .text("meta", meta("u1", 1, 0, now_ms()))
-        .part("audio", audio("take me to the ticket machines"))
+        .part("audio", audio("take me to the second escalators"))
         .part("frame", jpeg());
     let r = h
         .http
@@ -1106,11 +1135,221 @@ async fn should_guide_on_the_map_the_phone_chose() {
     assert_eq!(rx.next().await["destinationId"], "n4");
     assert_eq!(
         rx.next().await["text"],
-        "Turn right and walk to the ticket machines."
+        "Turn right and walk to the second escalators."
     );
     let n = h.nav.lock().unwrap();
     assert_eq!(n.map, "glories-basement");
     assert_eq!(n.route_request["goal"], "n4");
     let stt = h.eleven.lock().unwrap().stt_request.clone();
-    assert_eq!(stt["keyterms"], json!(["Main entrance", "Ticket machines"]));
+    let names: Vec<&Value> = nodes
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| &n["name"])
+        .collect();
+    assert_eq!(stt["keyterms"], json!(names));
+}
+
+/// Located, but nav-api has no route from there (a map walked one way only): the phone hears that once, not
+/// "Please hold still", and `route` is not asked again from the same node; from another node it is.
+#[tokio::test]
+async fn should_say_once_that_there_is_no_way_from_here_and_ask_again_only_from_elsewhere() {
+    let h = harness().await;
+    let c: Value = h
+        .http
+        .post(format!("{}/v1/clients", h.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let (cid, token) = (
+        c["clientId"].as_str().unwrap(),
+        c["clientToken"].as_str().unwrap(),
+    );
+    let url = |p: &str| format!("{}/v1/clients/{cid}/{p}", h.base);
+    let mut rx = Events::open(&h.http, format!("{}?token={token}", url("events"))).await;
+    rx.next().await;
+    {
+        let mut n = h.nav.lock().unwrap();
+        n.found = confirmed("n7");
+        n.route = json!({"found": false, "hops": []});
+    }
+    let form = Form::new()
+        .text("meta", meta("u1", 1, 0, now_ms()))
+        .part("audio", audio("take me to the drinks area"))
+        .part("frame", jpeg());
+    let r = h
+        .http
+        .post(url("inputs"))
+        .bearer_auth(token)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 202);
+    assert_eq!(rx.next().await["phase"], "navigating");
+    let ev = rx.next().await;
+    assert_eq!(
+        (ev["type"].as_str(), ev["text"].as_str()),
+        (
+            Some("guidance"),
+            Some("I can't find a way to the drinks area from here.")
+        )
+    );
+    // Still at the kitchen, every result confirming it: quiet, and no new route request.
+    let mut seq = 1;
+    for _ in 0..3 {
+        let form = Form::new()
+            .text("meta", meta(&format!("f{seq}"), 2, seq, now_ms()))
+            .part("frame", jpeg());
+        let r = h
+            .http
+            .post(url("frames"))
+            .bearer_auth(token)
+            .multipart(form)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 202);
+        seq += 1;
+        let ev = rx.next().await;
+        assert_eq!(
+            (ev["type"].as_str(), ev["quietReason"].as_str()),
+            (Some("heartbeat"), Some("unchanged"))
+        );
+    }
+    assert_eq!(h.nav.lock().unwrap().route_calls, 1);
+
+    // Somewhere else, there is a way: asked again, and guidance starts.
+    {
+        let mut n = h.nav.lock().unwrap();
+        n.found = confirmed("corridor");
+        n.route = path(&[("corridor", "n2", "turn_left", None)]);
+    }
+    let (ev, _, _) = frames_until_news(&h, &mut rx, &url("frames"), token, 2, seq).await;
+    assert_eq!(ev["text"], "Turn left.");
+    let n = h.nav.lock().unwrap();
+    assert_eq!(
+        (n.route_calls, n.route_request["start"].as_str()),
+        (2, Some("corridor"))
+    );
+}
+
+/// Replays one live session of the walk back (`walk_back()`): the phone on Glories Basement asks for the entrance
+/// escalator with its first frame, and every frame then gets the localize answer nav-api gave live, in order. Route
+/// requests get nav-api's real answers from that place. Returns every guidance text, in order.
+async fn replay_walk_back(h: &Harness, client: &str) -> Vec<String> {
+    let fixture = walk_back();
+    let session = fixture["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["client"] == client)
+        .unwrap();
+    let frames = session["frames"].as_array().unwrap();
+    {
+        let mut n = h.nav.lock().unwrap();
+        n.script = frames.iter().map(|f| f["localize"].clone()).collect();
+        for (start, by_trust) in fixture["routes"].as_object().unwrap() {
+            for (trust, answer) in by_trust.as_object().unwrap() {
+                n.routes.insert(format!("{start}/{trust}"), answer.clone());
+            }
+        }
+    }
+    let c: Value = h
+        .http
+        .post(format!("{}/v1/clients", h.base))
+        .json(&json!({"mapId": "glories-basement"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let (cid, token) = (
+        c["clientId"].as_str().unwrap(),
+        c["clientToken"].as_str().unwrap(),
+    );
+    let url = |p: &str| format!("{}/v1/clients/{cid}/{p}", h.base);
+    let mut rx = Events::open(&h.http, format!("{}?token={token}", url("events"))).await;
+    rx.next().await;
+    let form = Form::new()
+        .text("meta", meta("u1", 1, 0, now_ms()))
+        .part("audio", audio("take me to the entrance escalator"))
+        .part("frame", jpeg());
+    let r = h
+        .http
+        .post(url("inputs"))
+        .bearer_auth(token)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 202);
+    assert_eq!(rx.next().await["destinationId"], "n1");
+    let mut spoken = Vec::new();
+    for seq in 1..=frames.len() as i64 {
+        let ev = rx.next().await; // the previous frame's evaluation: guidance or a quiet heartbeat
+        if ev["type"] == "guidance" {
+            spoken.push(ev["text"].as_str().unwrap().to_string());
+        }
+        if seq == frames.len() as i64 {
+            break;
+        }
+        let form = Form::new()
+            .text("meta", meta(&format!("f{seq}"), 2, seq, now_ms()))
+            .part("frame", jpeg());
+        let r = h
+            .http
+            .post(url("frames"))
+            .bearer_auth(token)
+            .multipart(form)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 202);
+    }
+    assert!(
+        h.nav.lock().unwrap().script.is_empty(),
+        "every live answer was used"
+    );
+    spoken
+}
+
+/// Live (Glories Basement, 2026-10-10, session 00f49c7b): placed at Playground, Body Shop junction and Rituals shop on
+/// the way back, the orchestrator asked for a route 20 times (none over `observed`: the map was walked the other way)
+/// and said "Please hold still, I need a clearer view." throughout. Now "hold still" is only for before the first
+/// placement: it asks once from each place and says why it can't guide.
+#[tokio::test]
+async fn should_ask_once_per_place_and_say_there_is_no_way_on_the_live_walk_back() {
+    let h = harness_vars(false, &[("NAV_TRUST", "observed")]).await;
+    let spoken = replay_walk_back(&h, "00f49c7b").await;
+    assert_eq!(h.nav.lock().unwrap().route_starts, ["n9", "n8", "n5"]);
+    let no_way = "I can't find a way to the Entrance escalator from here.";
+    assert_eq!(
+        spoken,
+        [
+            "Please hold still, I need a clearer view.",
+            no_way,
+            no_way,
+            no_way
+        ]
+    );
+}
+
+/// The same walk back, routing over walked connections either way (the default): placed at the bar kiosk, the phone
+/// hears the way back as the map has it, the first hop's instruction for that direction, right after "hold still"
+/// while it was still locating.
+#[tokio::test]
+async fn should_guide_back_over_the_walked_connections_on_the_live_walk_back() {
+    let h = harness().await;
+    let spoken = replay_walk_back(&h, "74515567").await;
+    let n = h.nav.lock().unwrap();
+    assert_eq!(n.route_starts.first().map(String::as_str), Some("n13"));
+    assert_eq!(n.route_request["trust"], "any");
+    let first_hop = &walk_back()["routes"]["n13"]["any"]["hops"][0];
+    assert_eq!(spoken[0], "Please hold still, I need a clearer view.");
+    assert_eq!(Some(spoken[1].as_str()), first_hop["instruction"].as_str());
 }

@@ -189,6 +189,7 @@ struct Nav {
     hop: usize,
     votes: VecDeque<Vote>,
     off_hop_since: Option<i64>, // following: capturedAt of the first of the results in a row not pointing at the hop
+    no_route_from: Option<String>, // the node nav-api had no route from: `route` is asked again only from another one
 }
 
 impl Nav {
@@ -1165,6 +1166,7 @@ async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
     let arrived = matches!(&mv, Move::Located(n) | Move::Reached(n) if n == goal);
     if let Move::Located(n) = &mv
         && !arrived
+        && nav.no_route_from.as_ref() != Some(n)
     {
         let t = now_ms();
         match app.pipeline.path(n, goal, &caller).await {
@@ -1174,6 +1176,8 @@ async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
                 if route["found"] == true && hops.first().is_some_and(|h| h["source"] == n.as_str())
                 {
                     (nav.path, nav.hop) = (Some(hops), 0);
+                } else {
+                    nav.no_route_from = Some(n.clone());
                 }
                 base = merge(&base, json!({"route": route}));
             }
@@ -1185,6 +1189,9 @@ async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
         Some(path) => app
             .pipeline
             .hop_output(&path[nav.hop], nav.node.as_deref().unwrap_or("")),
+        None if nav.no_route_from.is_some() && nav.no_route_from == nav.node => {
+            Output::no_route(nav.node.as_deref().unwrap_or(""), &dest.label)
+        }
         None => Output::wait(nav.node.as_deref(), true), // locating: "Please hold still"
     };
 
@@ -1436,6 +1443,48 @@ mod tests {
         );
         assert_eq!(mv, Move::Reached("n4".into()));
         assert!(nav.path.is_none());
+    }
+
+    /// The walk back on Glories Basement, 2026-10-10 (tests/fixtures/glories-walk-back.json): the locating rules, run
+    /// over the localize answers nav-api gave live, place the user where the live orchestrator did, frame by frame, and
+    /// in the order walked. Most answers were `lost`: a `lost` result votes when its node leads clearly.
+    #[test]
+    fn should_place_the_user_on_the_live_walk_back_as_the_live_orchestrator_did() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/glories-walk-back.json")).unwrap();
+        let pipeline = Pipeline::from_vars(&|_| None);
+        let mut walked = Vec::new();
+        for s in fixture["sessions"].as_array().unwrap() {
+            let mut nav = Nav::default();
+            for (i, f) in s["frames"].as_array().unwrap().iter().enumerate() {
+                let found = &f["localize"];
+                let confirmed = pipeline.located(found);
+                let (_, _, mv) = advance(
+                    &mut nav,
+                    found,
+                    confirmed,
+                    (None, i as i64),
+                    &pipeline.nav_loop,
+                );
+                let placed = match mv {
+                    Move::Located(n) => Some(n),
+                    _ => None,
+                };
+                assert_eq!(
+                    placed.as_deref(),
+                    f["located"].as_str(),
+                    "session {} frame {i}",
+                    s["client"]
+                );
+                if let Some(n) = placed
+                    && walked.last() != Some(&n)
+                {
+                    walked.push(n);
+                }
+            }
+        }
+        // Bar kiosk, Orange shop, Playground, Body Shop junction, Rituals shop: back towards the entrance.
+        assert_eq!(walked, ["n13", "n10", "n9", "n8", "n5"]);
     }
 
     #[test]
