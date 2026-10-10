@@ -532,7 +532,8 @@ async fn sessions_frames_worker_and_stop() {
     }
 
     // The hop's target leads in 3 of the last 4: reached, and the next hop is spoken. No new route.
-    set_nav("corridor", h.nav.lock().unwrap().route.clone(), 0);
+    let route = h.nav.lock().unwrap().route.clone(); // the guard must drop before set_nav locks again
+    set_nav("corridor", route, 0);
     let (ev, seq, took) = frames_until_news(&h, &mut rx, &url("frames"), token, 2, 5).await;
     assert_eq!(
         (
@@ -633,7 +634,8 @@ async fn sessions_frames_worker_and_stop() {
     assert_eq!(route_calls(), 3);
 
     // Stop while the navigation model is still thinking: the late answer is never emitted.
-    set_nav("n7", h.nav.lock().unwrap().route.clone(), 300);
+    let route = h.nav.lock().unwrap().route.clone(); // the guard must drop before set_nav locks again
+    set_nav("n7", route, 300);
     assert_eq!(
         post_frame("g99", 3, seq, now_ms()).await.unwrap().status(),
         202
