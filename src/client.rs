@@ -380,6 +380,54 @@ pub fn bad_request(message: impl ToString) -> ApiError {
 
 pub type ApiResult<T> = Result<T, ApiError>;
 
+/// Debug lines the phone posts to `POST /v1/logs`. Each becomes one structured entry on stdout,
+/// next to the server's own trace, so one Cloud Logging query shows both sides of a session.
+/// Failures before a client exists (permissions, no camera) are only visible this way.
+pub fn client_logs(app: &App, body: &[u8]) -> ApiResult<Vec<Value>> {
+    const MAX_BODY: usize = 16 * 1024;
+    const MAX_ENTRIES: usize = 50;
+    if body.len() > MAX_BODY {
+        return Err(api_error(
+            413,
+            "payload_too_large",
+            "Log batch is too large.",
+        ));
+    }
+    let v: Value = serde_json::from_slice(body).map_err(|_| bad_request("Body is not JSON."))?;
+    let entries = v
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| bad_request("Missing entries."))?;
+    if entries.len() > MAX_ENTRIES {
+        return Err(bad_request("Too many entries."));
+    }
+    let text = |v: &Value, key: &str, max: usize| -> Option<String> {
+        v.get(key)
+            .and_then(Value::as_str)
+            .map(|s| s.chars().take(max).collect())
+    };
+    let device_id = text(&v, "deviceId", 64);
+    let client_id = text(&v, "clientId", 64);
+    let received_at = now_ms();
+    Ok(entries
+        .iter()
+        .map(|e| {
+            let level = e
+                .get("level")
+                .and_then(Value::as_str)
+                .filter(|l| ["info", "warn", "error"].contains(l))
+                .unwrap_or("info");
+            json!({
+                "kind": "client_log", "source": "web", "level": level,
+                "at": e.get("at").and_then(Value::as_i64), "receivedAt": received_at,
+                "deviceId": device_id, "clientId": client_id,
+                "event": text(e, "event", 64), "detail": text(e, "detail", 1000),
+                "commit": app.commit, "version": env!("CARGO_PKG_VERSION"),
+            })
+        })
+        .collect())
+}
+
 /// A new client with its token. The response body is the contract's `POST /v1/clients` reply.
 pub fn create_client(app: &App, id: String) -> (ClientRef, Value) {
     let token = format!(
@@ -982,6 +1030,39 @@ mod tests {
         assert_eq!(events.len(), 1);
         let got = futures::executor::block_on(a.next()).unwrap();
         assert_eq!(got["type"], "state");
+    }
+
+    #[test]
+    fn should_turn_a_client_log_batch_into_structured_entries() {
+        let get = |k: &str| (k == "GIT_SHA").then(|| "abc123".to_string());
+        let route: Route = serde_json::from_str(include_str!("route.json")).unwrap();
+        let app = Arc::new(AppState::new(route, Pipeline::from_vars(&get), &get));
+        let body = br#"{"deviceId":"d1","clientId":"c1","entries":[
+            {"at":5,"level":"error","event":"permission_denied","detail":"NotAllowedError"},
+            {"at":6,"level":"nonsense","event":"x"}]}"#;
+        let out = client_logs(&app, body).ok().unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["kind"], "client_log");
+        assert_eq!(out[0]["level"], "error");
+        assert_eq!(out[0]["detail"], "NotAllowedError");
+        assert_eq!(out[0]["commit"], "abc123");
+        assert_eq!(out[1]["level"], "info");
+    }
+
+    #[test]
+    fn should_reject_oversized_or_malformed_client_logs() {
+        let get = |_: &str| None;
+        let route: Route = serde_json::from_str(include_str!("route.json")).unwrap();
+        let app = Arc::new(AppState::new(route, Pipeline::from_vars(&get), &get));
+        assert_eq!(
+            client_logs(&app, &vec![b' '; 20_000]).unwrap_err().status,
+            413
+        );
+        assert_eq!(client_logs(&app, b"nope").unwrap_err().status, 400);
+        assert_eq!(
+            client_logs(&app, br#"{"entries":"x"}"#).unwrap_err().status,
+            400
+        );
     }
 
     #[test]
