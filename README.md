@@ -8,7 +8,8 @@ It implements [`docs/contracts.md`](https://github.com/tungsten-united/project-d
 
 - **Client:** one phone from Start to Stop. It holds the token and the event stream (`/v1/clients/{id}/…`).
 - **Session:** one spoken action, such as going to the drinks area. The phone sends audio, the orchestrator runs speech-to-text, then Jev picks the action. A different action from the current session starts a new session, with a new `sessionId`, a new generation, an empty frame buffer and no previous output. The same action keeps the current session.
-- **Frame buffer:** each session keeps its last `NAV_FRAMES` (4) frames. nav-api's `localize` gets all of them, oldest first, as repeated `images` parts.
+- **Frame buffer:** each session keeps its last `NAV_FRAMES` (4) frames. Each `localize` call gets the ones it has not sent before, oldest first, each with the phone's `motion`.
+- **Navigation loop:** locate the user (votes over `localize` results), one `route`, then follow it hop by hop: each `localize` (previous = hop source, expected = hop target) is a vote, and only the hop's target can be reached. Lost, it locates again (contracts.md section 2). Live test: `tests/live_nav.rs` (`--ignored`, needs `NAV_URL`, `NAV_API_TOKEN`, `NAV_LIVE_IMAGE`).
 - **Worker:** one per client. It evaluates the newest frame, validates the navigation answer against the route, and compares the result with the session's previous output. It sends `guidance` only when the output changed or the user asked for the same destination again; otherwise it sends a quiet `heartbeat`.
 
 ## Run
@@ -135,7 +136,11 @@ To require approval before each release, add required reviewers to the `staging`
 | `ELEVENLABS_VOICE_ID` | unset | Voice for `GET /speech`, picked in S06. Unset: `GET /speech` answers 503 and the phone uses browser TTS |
 | `SPEECH_LANGUAGE` | `en` | Sent to ElevenLabs for both directions, so Scribe skips language detection |
 | `NAV_FRAMES` | `4` | Frames per `localize` call (nav-api takes at most 4) |
-| `NAV_AGREE` | `3` | Localizations in a row that an unconfirmed top candidate must lead to count as reached, when it is a node still ahead on the route |
+| `NAV_BURST` | `1` | Frames not sent to `localize` yet that start an evaluation (each frame is sent once) |
+| `NAV_VOTE_K` | `3` | Votes needed among the last `NAV_VOTE_N` localizations to locate the user, reach the hop's target, or call them lost |
+| `NAV_VOTE_N` | `4` | Window of the votes |
+| `NAV_MARGIN` | `0.04` | A localization votes only when its best node leads the second by this much |
+| `NAV_LOST_CALLS` | `10` | `lost` results in a row, while following, that start a new navigation |
 | `ROUTE_PATH` | built-in `src/route.json` | Route definition |
 | `MAX_INPUT_AGE_MS` | `3000` | Reject older input |
 | `TRACE_PATH` | unset | Also append the run trace as JSON lines to this file |

@@ -51,12 +51,14 @@ fn after(node: &str, goal: &str) -> String {
     }
 }
 
-/// nav-api's `POST /maps/{map}/localize`.
+/// nav-api's `POST /maps/{map}/localize`. "advance" shows the hop's target (`expected`), "arrived" the destination,
+/// "unsure" no clear leader, anything else the node the user is at (`previous`, or "start").
 async fn localize(State(ctl): State<Shared>, mut mp: Multipart) -> Result<Json<Value>, StatusCode> {
-    let (mut previous, mut frames) = (None, 0);
+    let (mut previous, mut expected, mut frames) = (None, None, 0);
     while let Ok(Some(field)) = mp.next_field().await {
         match field.name() {
             Some("previous") => previous = field.text().await.ok(),
+            Some("expected") => expected = field.text().await.ok(),
             Some("images") => frames += 1,
             _ => {}
         }
@@ -69,21 +71,21 @@ async fn localize(State(ctl): State<Shared>, mut mp: Multipart) -> Result<Json<V
     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 
     let here = previous.clone().unwrap_or_else(|| "start".into());
-    let (status, best) = match preset.as_str() {
+    let (status, best, margin) = match preset.as_str() {
         "fail" => return Err(StatusCode::INTERNAL_SERVER_ERROR),
-        "unsure" => ("uncertain", here),
-        "advance" if previous.is_none() => ("confirmed", here),
-        "advance" => ("confirmed", after(&here, &goal)),
-        "arrived" if !goal.is_empty() => ("confirmed", goal),
-        _ => ("confirmed", here),
+        "unsure" => ("uncertain", here, 0.01),
+        "advance" => ("confirmed", expected.clone().unwrap_or(here), 0.1),
+        "arrived" if !goal.is_empty() => ("confirmed", goal, 0.1),
+        _ => ("confirmed", here, 0.1),
     };
     Ok(Json(json!({
-        "status": status, "reason": format!("fake {preset}, {frames} frames"), "best": best, "margin": 0.1,
+        "status": status, "reason": format!("fake {preset}, {frames} frames"), "best": best, "margin": margin,
         "candidates": [{"node": best, "name": best, "score": 0.7, "refs": []}], "previous": previous,
+        "expected": expected,
     })))
 }
 
-/// nav-api's `POST /maps/{map}/route`: one hop toward the goal.
+/// nav-api's `POST /maps/{map}/route`: the fake walk from `start` to the goal, hop by hop.
 async fn route(State(ctl): State<Shared>, Json(req): Json<Value>) -> Json<Value> {
     let (start, goal) = (
         req["start"].as_str().unwrap_or(""),
@@ -99,11 +101,17 @@ async fn route(State(ctl): State<Shared>, Json(req): Json<Value>) -> Json<Value>
         "right" => "turn_right",
         _ => "straight",
     };
-    let hop = json!({"edge": "e1", "source": start, "target": after(start, goal), "forward": true, "length_m": 5.0,
-                     "bearing_deg": null, "instruction": null, "steps": [{"action": step}], "status": "observed"});
+    let (mut hops, mut node) = (Vec::new(), start.to_string());
+    while node != goal && hops.len() < 3 {
+        let next = after(&node, goal);
+        hops.push(json!({"edge": format!("e{}", hops.len() + 1), "source": node, "target": next, "forward": true,
+                         "length_m": 5.0, "bearing_deg": null, "instruction": null, "steps": [{"action": step}],
+                         "status": "observed"}));
+        node = next;
+    }
     Json(match preset.as_str() {
         "off_route" => json!({"start": start, "goal": goal, "found": false, "hops": []}),
-        _ => json!({"start": start, "goal": goal, "found": true, "hops": [hop]}),
+        _ => json!({"start": start, "goal": goal, "found": true, "hops": hops}),
     })
 }
 

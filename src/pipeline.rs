@@ -3,6 +3,7 @@
 //!
 //! Every model output is validated here. Nothing in this module changes session state.
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -90,13 +91,101 @@ impl Output {
     }
 }
 
+/// The navigation loop's settings (contracts.md section 2, "Navigation loop"). The defaults come from replaying the
+/// Itnig walks through the same loop (nav-engine's `nav map orchestrator-replay`).
+#[derive(Clone, Copy, Debug)]
+pub struct NavLoop {
+    pub burst: usize, // NAV_BURST: frames not sent to localize yet that start an evaluation
+    pub k: usize,     // NAV_VOTE_K: votes needed ...
+    pub n: usize,     // NAV_VOTE_N: ... among the last n localizations
+    pub margin: f64, // NAV_MARGIN: a result votes only when its best node leads the second by this much
+    pub lost_calls: u32, // NAV_LOST_CALLS: `lost` results in a row, while following, that start a new navigation
+}
+
+/// One localization's vote in the navigation loop.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Vote {
+    /// Locating: the user seems to be at this node.
+    At(String),
+    /// Following: the hop's target leads.
+    Target,
+    /// Following: a node that is neither the hop's source nor its target leads.
+    Elsewhere,
+    Abstain,
+}
+
+impl Vote {
+    /// How the trace shows it.
+    pub fn name(&self) -> String {
+        match self {
+            Vote::At(node) => node.clone(),
+            Vote::Target => "target".into(),
+            Vote::Elsewhere => "elsewhere".into(),
+            Vote::Abstain => "none".into(),
+        }
+    }
+}
+
+/// What a `localize` call says besides the frames: the hop being followed, or the last node when locating again.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Ask {
+    pub previous: Option<String>,
+    pub expected: Option<String>,
+    pub previous_step_count: Option<i64>,
+}
+
+/// Who a nav-api call is for: sent as X-Client-Id, X-Session-Id and X-Request-Id, so nav-api's log joins the trace.
+#[derive(Clone, Debug, Default)]
+pub struct Caller {
+    pub client: String,
+    pub session: Option<String>,
+    pub request: String,
+}
+
+/// The best node of a localization, when it leads the second by `margin` and the user can be there: the result
+/// isn't `lost`, and nav-api doesn't mark it as farther than they walked (`plausible: false`).
+fn leader(found: &Value, margin: f64) -> Option<&str> {
+    let best = found["best"].as_str().filter(|n| !n.is_empty())?;
+    let top = &found["candidates"][0];
+    let too_far = top["node"] == best && top["plausible"] == false;
+    let lead = found["margin"].as_f64().unwrap_or(0.0);
+    (found["status"] != "lost" && lead >= margin && !too_far).then_some(best)
+}
+
+/// Locating: the leading node gets a vote.
+pub fn locate_vote(found: &Value, margin: f64) -> Vote {
+    leader(found, margin).map_or(Vote::Abstain, |n| Vote::At(n.into()))
+}
+
+/// Following the hop `source -> target`: has the user reached the target, or are they somewhere else?
+pub fn follow_vote(found: &Value, source: &str, target: &str, margin: f64) -> Vote {
+    match leader(found, margin) {
+        Some(n) if n == target => Vote::Target,
+        Some(n) if n != source => Vote::Elsewhere,
+        _ => Vote::Abstain,
+    }
+}
+
+/// Adds `vote` to the last `n` votes and counts the ones equal to it (none for an abstention).
+pub fn tally(votes: &mut VecDeque<Vote>, vote: Vote, n: usize) -> usize {
+    votes.push_back(vote.clone());
+    while votes.len() > n.max(1) {
+        votes.pop_front();
+    }
+    if vote == Vote::Abstain {
+        0
+    } else {
+        votes.iter().filter(|v| **v == vote).count()
+    }
+}
+
 pub struct Pipeline {
     http: reqwest::Client,
     pub nav_url: String,
     nav_map: String,
     nav_token: String,
     nav_trust: String,
-    nav_agree: u32,
+    pub nav_loop: NavLoop,
     pub engine: String,
     eleven: ElevenLabs,
     jev_url: String,
@@ -264,7 +353,13 @@ impl Pipeline {
             nav_map: env("NAV_MAP_ID", "itnig"),
             nav_token: env("NAV_API_TOKEN", ""),
             nav_trust: env("NAV_TRUST", "observed"),
-            nav_agree: env("NAV_AGREE", "3").parse().expect("NAV_AGREE"),
+            nav_loop: NavLoop {
+                burst: env("NAV_BURST", "1").parse().expect("NAV_BURST"),
+                k: env("NAV_VOTE_K", "3").parse().expect("NAV_VOTE_K"),
+                n: env("NAV_VOTE_N", "4").parse().expect("NAV_VOTE_N"),
+                margin: env("NAV_MARGIN", "0.04").parse().expect("NAV_MARGIN"),
+                lost_calls: env("NAV_LOST_CALLS", "10").parse().expect("NAV_LOST_CALLS"),
+            },
             engine: env("NAV_ENGINE", "nav-engine"),
             eleven: ElevenLabs {
                 url: env("ELEVENLABS_URL", ELEVENLABS_URL),
@@ -408,11 +503,16 @@ impl Pipeline {
         }
     }
 
-    /// A request to nav-api for the venue's map, with its token when one is set.
-    fn nav(&self, path: &str) -> reqwest::RequestBuilder {
-        let r = self
+    /// A request to nav-api for the venue's map, with the caller's ids and the token when one is set.
+    fn nav(&self, path: &str, caller: &Caller) -> reqwest::RequestBuilder {
+        let mut r = self
             .http
-            .post(format!("{}/maps/{}/{path}", self.nav_url, self.nav_map));
+            .post(format!("{}/maps/{}/{path}", self.nav_url, self.nav_map))
+            .header("X-Client-Id", &caller.client)
+            .header("X-Request-Id", &caller.request);
+        if let Some(session) = &caller.session {
+            r = r.header("X-Session-Id", session);
+        }
         if self.nav_token.is_empty() {
             r
         } else {
@@ -420,30 +520,46 @@ impl Pipeline {
         }
     }
 
-    /// `POST /maps/{map}/localize`: which node the session's last frames show (at most 4, oldest first),
-    /// with the phone's compass heading when it has one.
+    /// `POST /maps/{map}/localize`: which node the frames show (at most 4, oldest first, each with the phone's motion
+    /// as it sent it), with the hop being followed or the last node (`ask`).
     pub async fn locate(
         &self,
-        frames: Vec<Vec<u8>>,
-        previous: Option<&str>,
-        heading_deg: Option<f64>,
+        frames: Vec<(Option<Value>, Vec<u8>)>,
+        ask: &Ask,
+        caller: &Caller,
     ) -> Result<Value, BoxError> {
         let skip = frames.len().saturating_sub(MAX_LOCALIZE_FRAMES);
+        let frames: Vec<_> = frames.into_iter().skip(skip).collect();
         let mut form = Form::new();
-        if let Some(node) = previous {
-            form = form.text("previous", node.to_string());
+        if let Some(node) = &ask.previous {
+            form = form.text("previous", node.clone());
         }
-        if let Some(h) = heading_deg {
+        if let Some(node) = &ask.expected {
+            form = form.text("expected", node.clone());
+        }
+        let heading = frames
+            .last()
+            .and_then(|(m, _)| m.as_ref()?["headingDeg"].as_f64());
+        if let Some(h) = heading {
             form = form.text("heading_deg", h.to_string());
         }
-        for (i, frame) in frames.into_iter().skip(skip).enumerate() {
+        if frames.iter().any(|(m, _)| m.is_some()) {
+            // nav-api wants one motion part per image, `null` for a frame without one.
+            for (m, _) in &frames {
+                form = form.text("motion", m.as_ref().map_or("null".into(), Value::to_string));
+            }
+            if let (Some(_), Some(steps)) = (&ask.previous, ask.previous_step_count) {
+                form = form.text("previous_step_count", steps.to_string());
+            }
+        }
+        for (i, (_, frame)) in frames.into_iter().enumerate() {
             let part = Part::bytes(frame)
                 .file_name(format!("frame{i}.jpg"))
                 .mime_str("image/jpeg")?;
             form = form.part("images", part);
         }
         let out: Value = self
-            .nav("localize")
+            .nav("localize", caller)
             .multipart(form)
             .timeout(Duration::from_secs(4))
             .send()
@@ -458,9 +574,9 @@ impl Pipeline {
     }
 
     /// `POST /maps/{map}/route`: the route from `start` to `goal` over edges trusted as `NAV_TRUST`.
-    pub async fn path(&self, start: &str, goal: &str) -> Result<Value, BoxError> {
+    pub async fn path(&self, start: &str, goal: &str, caller: &Caller) -> Result<Value, BoxError> {
         let out: Value = self
-            .nav("route")
+            .nav("route", caller)
             .json(&json!({"start": start, "goal": goal, "trust": self.nav_trust}))
             .timeout(Duration::from_secs(2))
             .send()
@@ -486,33 +602,19 @@ impl Pipeline {
             .flatten()
     }
 
-    /// A node still ahead on the route that has been the top unconfirmed candidate `NAV_AGREE` localizations in a row.
-    /// `streak` is the session's (top candidate, consecutive count).
-    pub fn followed(
-        &self,
-        found: &Value,
-        streak: &mut (String, u32),
-        ahead: &[String],
-    ) -> Option<String> {
-        let top = if found["status"] == "lost" {
-            ""
-        } else {
-            found["best"].as_str().unwrap_or("")
-        };
-        if streak.0 == top {
-            streak.1 += 1;
-        } else {
-            *streak = (top.to_string(), 1);
+    /// Turn a route from `node` into an Output: its first hop (`hop_output`), or `wait` when nav-api found none.
+    pub fn validate(&self, route: &Value, node: &str) -> Output {
+        if route["found"] != true {
+            return Output::wait(Some(node), false);
         }
-        (!top.is_empty() && streak.1 >= self.nav_agree && ahead.iter().any(|n| n == top))
-            .then(|| top.to_string())
+        self.hop_output(&route["hops"][0], node)
     }
 
-    /// Turn a route from `node` into an Output: its first hop, with the turn its first step starts with.
-    pub fn validate(&self, route: &Value, node: &str) -> Output {
-        let hop = &route["hops"][0];
+    /// The output for walking `hop` from `node`: `turn` when its first step is a turn, otherwise `continue`, with the
+    /// hop's instruction cut to whole sentences; `wait` when the hop doesn't start at `node`.
+    pub fn hop_output(&self, hop: &Value, node: &str) -> Output {
         let next = hop["target"].as_str().filter(|n| !n.is_empty());
-        if route["found"] != true || hop["source"] != node || next.is_none() {
+        if hop["source"] != node || next.is_none() {
             return Output::wait(Some(node), false);
         }
         let direction = match hop["steps"][0]["action"].as_str() {
@@ -629,35 +731,53 @@ mod tests {
     }
 
     #[test]
-    fn should_follow_a_node_ahead_on_the_route_after_agreeing_localizations() {
-        let p = Pipeline::from_vars(&|_| None);
-        let ahead = ["n5".to_string(), "n8".to_string()];
-        let top = |status: &str, best: &str| json!({"status": status, "best": best});
-        let mut streak = (String::new(), 0);
+    fn should_vote_on_the_leading_node_only_when_it_clearly_leads() {
+        let found = |status: &str, best: &str, margin: f64| {
+            json!({"status": status, "best": best, "margin": margin,
+                   "candidates": [{"node": best, "score": 0.4, "plausible": null}]})
+        };
+        // low scores are fine: what counts is which node leads
         assert_eq!(
-            p.followed(&top("uncertain", "n8"), &mut streak, &ahead),
-            None
+            locate_vote(&found("uncertain", "n4", 0.05), 0.04),
+            Vote::At("n4".into())
         );
         assert_eq!(
-            p.followed(&top("uncertain", "n8"), &mut streak, &ahead),
-            None
+            locate_vote(&found("uncertain", "n4", 0.02), 0.04),
+            Vote::Abstain
+        );
+        assert_eq!(locate_vote(&found("lost", "n4", 0.2), 0.04), Vote::Abstain);
+        assert_eq!(
+            locate_vote(&json!({"status": "lost", "candidates": []}), 0.04),
+            Vote::Abstain
+        );
+        let mut too_far = found("uncertain", "n5", 0.1);
+        too_far["candidates"][0]["plausible"] = json!(false);
+        assert_eq!(locate_vote(&too_far, 0.04), Vote::Abstain);
+        assert_eq!(follow_vote(&too_far, "n4", "n5", 0.04), Vote::Abstain);
+        assert_eq!(
+            follow_vote(&found("uncertain", "n5", 0.05), "n4", "n5", 0.04),
+            Vote::Target
         );
         assert_eq!(
-            p.followed(&top("uncertain", "n8"), &mut streak, &ahead),
-            Some("n8".into())
+            follow_vote(&found("confirmed", "n4", 0.1), "n4", "n5", 0.04),
+            Vote::Abstain
         );
-        assert_eq!(p.followed(&top("lost", "n8"), &mut streak, &ahead), None);
+        // the goal seen from afar is not the next node
         assert_eq!(
-            p.followed(&top("uncertain", "n8"), &mut streak, &ahead),
-            None
+            follow_vote(&found("uncertain", "n8", 0.1), "n4", "n5", 0.04),
+            Vote::Elsewhere
         );
-        let mut streak = (String::new(), 0);
-        for _ in 0..3 {
-            assert_eq!(
-                p.followed(&top("uncertain", "n2"), &mut streak, &ahead),
-                None
-            );
-        }
+    }
+
+    #[test]
+    fn should_count_votes_among_the_last_n() {
+        let mut votes = VecDeque::new();
+        assert_eq!(tally(&mut votes, Vote::Target, 4), 1);
+        assert_eq!(tally(&mut votes, Vote::Abstain, 4), 0);
+        assert_eq!(tally(&mut votes, Vote::Target, 4), 2);
+        assert_eq!(tally(&mut votes, Vote::Elsewhere, 4), 1);
+        assert_eq!(tally(&mut votes, Vote::Target, 4), 2); // the first Target fell out of the window
+        assert_eq!(votes.len(), 4);
     }
 
     #[test]
@@ -692,6 +812,16 @@ mod tests {
         assert_eq!(
             p.validate(&route("straight"), "n1"),
             out("wait", None, "n1", false)
+        );
+        // the next hop, once the user reached n3
+        let got = p.hop_output(&route("turn_left")["hops"][1], "n3");
+        assert_eq!(
+            (
+                got.action.as_str(),
+                got.next.as_deref(),
+                got.instruction.as_deref()
+            ),
+            ("continue", Some("n4"), Some("Bear right."))
         );
     }
 
