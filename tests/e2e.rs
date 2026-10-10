@@ -10,14 +10,14 @@ use std::time::Duration;
 
 use axum::extract::{Multipart, Path, Query};
 use axum::http::HeaderMap;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::{Stream, StreamExt};
 use reqwest::multipart::{Form, Part};
 use serde_json::{Value, json};
 
 use orient_orchestrator::client::{AppState, now_ms};
-use orient_orchestrator::pipeline::{Pipeline, Route};
+use orient_orchestrator::pipeline::Pipeline;
 use orient_orchestrator::server;
 
 #[derive(Default)]
@@ -35,6 +35,20 @@ struct FakeNav {
     route_calls: usize,
     auth: Option<String>,
     caller: Value, // the X-*-Id headers of the last localize
+    map: String,   // the map of the last localize
+}
+
+/// The maps the fake nav-api publishes, as `GET /maps/{map_id}` serves them (the fields the orchestrator reads).
+fn fake_map(map_id: &str) -> Option<Value> {
+    let nodes = match map_id {
+        "itnig" => json!([{"id": "n2", "name": "drinks area"}, {"id": "n7", "name": "kitchen"},
+                          {"id": "n8", "name": "stage"}]),
+        "glories-basement" => {
+            json!([{"id": "n1", "name": "Main entrance"}, {"id": "n4", "name": "Ticket machines"}])
+        }
+        _ => return None,
+    };
+    Some(json!({"map_id": map_id, "place": map_id, "nodes": nodes, "edges": []}))
 }
 
 /// What the fake ElevenLabs received.
@@ -62,13 +76,32 @@ async fn serve(router: Router, port: u16) -> String {
     format!("http://{addr}")
 }
 
-/// `with_jev`: a fake TypeSafe that picks the coffee and keeps every changed direction quiet.
+/// `with_jev`: a fake TypeSafe that picks the drinks area and keeps every changed direction quiet.
 async fn harness_with(with_jev: bool) -> Harness {
     let nav = Arc::new(Mutex::new(FakeNav::default()));
     let fake = nav.clone();
-    let fake_nav = Router::new().route(
-        "/maps/itnig/localize",
-        post(move |headers: HeaderMap, mut mp: Multipart| {
+    let fake_nav = Router::new()
+        .route(
+            "/maps",
+            get(|| async {
+                // newest first, as nav-api lists them
+                Json(
+                    json!([{"map_id": "glories-basement", "place": "Glories Basement", "nodes": 2},
+                            {"map_id": "itnig", "place": "Itnig", "nodes": 3}]),
+                )
+            }),
+        )
+        .route(
+            "/maps/{map}",
+            get(|Path(map): Path<String>| async move {
+                fake_map(&map)
+                    .map(Json)
+                    .ok_or(axum::http::StatusCode::NOT_FOUND)
+            }),
+        );
+    let fake_nav = fake_nav.route(
+        "/maps/{map}/localize",
+        post(move |Path(map): Path<String>, headers: HeaderMap, mut mp: Multipart| {
             let fake = fake.clone();
             async move {
                 let (mut frames, mut previous, mut expected, mut heading) = (0, None, None, None);
@@ -87,6 +120,7 @@ async fn harness_with(with_jev: bool) -> Harness {
                 let header = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).map(String::from);
                 let (answer, delay) = {
                     let mut n = fake.lock().unwrap();
+                    n.map = map;
                     n.frames_seen = frames;
                     n.previous = previous;
                     n.expected = expected;
@@ -108,7 +142,7 @@ async fn harness_with(with_jev: bool) -> Harness {
     );
     let fake = nav.clone();
     let fake_nav = fake_nav.route(
-        "/maps/itnig/route",
+        "/maps/{map}/route",
         post(move |Json(req): Json<Value>| {
             let fake = fake.clone();
             async move {
@@ -209,8 +243,7 @@ async fn harness_with(with_jev: bool) -> Harness {
                 vars.push(("TYPESAFE_API_KEY", "test-jev-key".into()));
             }
             let get = |k: &str| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone());
-            let route: Route = serde_json::from_str(include_str!("../src/route.json")).unwrap();
-            let app = Arc::new(AppState::new(route, Pipeline::from_vars(&get), &get));
+            let app = Arc::new(AppState::new(Pipeline::from_vars(&get), &get));
             serve(server::router(app), 0).await
         }
     };
@@ -433,7 +466,7 @@ async fn sessions_frames_worker_and_stop() {
     );
     let form = Form::new()
         .text("meta", meta("u1", 1, 0, now_ms()))
-        .part("audio", audio("take me to the coffee"))
+        .part("audio", audio("take me to the drinks area"))
         .part("frame", jpeg());
     let r = h
         .http
@@ -481,8 +514,7 @@ async fn sessions_frames_worker_and_stop() {
     assert_eq!(
         stt,
         json!({"model_id": "scribe_v2", "language_code": "en", "tag_audio_events": "false", "fileType": "audio/webm",
-            "keyterms": ["drinks area", "drinks", "drink", "coffee", "water", "bar", "fridge", "kitchen", "kitchen",
-                "stage", "stage", "talks", "talk", "presentation"]})
+            "keyterms": ["drinks area", "kitchen", "stage"]})
     );
 
     // Replays, old sequences and old captures are rejected without side effects.
@@ -551,7 +583,7 @@ async fn sessions_frames_worker_and_stop() {
 
     // Same action again: same session, same generation, and the next output is spoken.
     assert_eq!(
-        say("u2", 2, seq, "the coffee please")
+        say("u2", 2, seq, "the drinks area please")
             .await
             .unwrap()
             .status(),
@@ -702,14 +734,24 @@ async fn sessions_frames_worker_and_stop() {
     assert!(t.contains("\"framesSent\":1") && t.contains("vote target") && !t.contains(token));
 }
 
+/// The server alone, with a fake nav-api that only serves the maps (clients need their map's places).
 async fn local_server(vars: &[(&str, &str)]) -> String {
+    let maps = Router::new().route(
+        "/maps/{map}",
+        get(|Path(map): Path<String>| async move {
+            fake_map(&map)
+                .map(Json)
+                .ok_or(axum::http::StatusCode::NOT_FOUND)
+        }),
+    );
+    let nav_url = serve(maps, 0).await;
     let get = |k: &str| {
         vars.iter()
             .find(|(n, _)| *n == k)
             .map(|(_, v)| v.to_string())
+            .or_else(|| (k == "NAV_URL").then(|| nav_url.clone()))
     };
-    let route: Route = serde_json::from_str(include_str!("../src/route.json")).unwrap();
-    let app = Arc::new(AppState::new(route, Pipeline::from_vars(&get), &get));
+    let app = Arc::new(AppState::new(Pipeline::from_vars(&get), &get));
     serve(server::router(app), 0).await
 }
 
@@ -941,7 +983,7 @@ async fn should_follow_the_route_hop_by_hop_to_arrival() {
     }
     let form = Form::new()
         .text("meta", meta("u1", 1, 0, now_ms()))
-        .part("audio", audio("take me to the coffee"))
+        .part("audio", audio("take me to the drinks area"))
         .part("frame", jpeg());
     let r = h
         .http
@@ -985,4 +1027,90 @@ async fn should_follow_the_route_hop_by_hop_to_arrival() {
         .await
         .unwrap();
     assert_eq!(r.status(), 409);
+}
+
+/// Any published map: the phone lists them, picks one, and its places are that map's nodes. Saying one guides there,
+/// with every nav-api call on that map; an unknown or malformed map id is refused before a client exists.
+#[tokio::test]
+async fn should_guide_on_the_map_the_phone_chose() {
+    let h = harness().await;
+    let maps: Value = h
+        .http
+        .get(format!("{}/v1/maps", h.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        maps,
+        json!([{"mapId": "itnig", "place": "Itnig"}, {"mapId": "glories-basement", "place": "Glories Basement"}])
+    );
+
+    let create = |body: Value| {
+        h.http
+            .post(format!("{}/v1/clients", h.base))
+            .json(&body)
+            .send()
+    };
+    assert_eq!(
+        create(json!({"mapId": "nowhere"})).await.unwrap().status(),
+        404
+    );
+    assert_eq!(
+        create(json!({"mapId": "../itnig"})).await.unwrap().status(),
+        400
+    );
+    let c: Value = create(json!({"mapId": "glories-basement"}))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        c["route"],
+        json!({"routeId": "glories-basement", "destinations": [
+            {"destinationId": "n1", "label": "Main entrance"}, {"destinationId": "n4", "label": "Ticket machines"}]})
+    );
+    let (cid, token) = (
+        c["clientId"].as_str().unwrap(),
+        c["clientToken"].as_str().unwrap(),
+    );
+    let url = |p: &str| format!("{}/v1/clients/{cid}/{p}", h.base);
+    let mut rx = Events::open(&h.http, format!("{}?token={token}", url("events"))).await;
+    rx.next().await;
+    {
+        let mut n = h.nav.lock().unwrap();
+        n.found = confirmed("n1");
+        n.route = path(&[(
+            "n1",
+            "n4",
+            "turn_right",
+            Some("Turn right and walk to the ticket machines."),
+        )]);
+    }
+    let form = Form::new()
+        .text("meta", meta("u1", 1, 0, now_ms()))
+        .part("audio", audio("take me to the ticket machines"))
+        .part("frame", jpeg());
+    let r = h
+        .http
+        .post(url("inputs"))
+        .bearer_auth(token)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 202);
+    assert_eq!(rx.next().await["destinationId"], "n4");
+    assert_eq!(
+        rx.next().await["text"],
+        "Turn right and walk to the ticket machines."
+    );
+    let n = h.nav.lock().unwrap();
+    assert_eq!(n.map, "glories-basement");
+    assert_eq!(n.route_request["goal"], "n4");
+    let stt = h.eleven.lock().unwrap().stt_request.clone();
+    assert_eq!(stt["keyterms"], json!(["Main entrance", "Ticket machines"]));
 }

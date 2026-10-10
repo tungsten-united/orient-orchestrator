@@ -12,6 +12,7 @@ async fn should_locate_and_route_on_the_live_nav_api() {
     let p = Pipeline::from_vars(&get);
     let image = std::fs::read(get("NAV_LIVE_IMAGE").expect("NAV_LIVE_IMAGE")).unwrap();
     let caller = Caller {
+        map: p.default_map.clone(),
         client: "live-test".into(),
         session: None,
         request: "live-1".into(),
@@ -31,6 +32,14 @@ async fn should_locate_and_route_on_the_live_nav_api() {
     assert!(["confirmed", "uncertain", "lost"].contains(&found["status"].as_str().unwrap()));
     assert!(found["candidates"].is_array() && found["margin"].is_number());
     let _ = locate_vote(&found, p.nav_loop.margin, p.nav_loop.locate_lost_margin);
+
+    // The map's places, as a phone choosing it gets them.
+    let place = p
+        .place(&p.default_map)
+        .await
+        .expect("map")
+        .expect("published map");
+    assert!(place.destinations.iter().any(|d| d.destination_id == "n2"));
 
     // One route from the entrance to the drinks area, then a localize on its first hop.
     let route = p.path("n1", "n2", &caller).await.expect("route");

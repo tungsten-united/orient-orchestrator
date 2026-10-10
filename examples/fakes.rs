@@ -1,4 +1,4 @@
-//! Fake upstreams for local runs and staging: nav-api (`localize`, `route`) and ElevenLabs speech-to-text
+//! Fake upstreams for local runs and staging: nav-api (the maps, `localize`, `route`) and ElevenLabs speech-to-text
 //! on one port (`BIND`, default 127.0.0.1:8001), because Cloud Run gives each service a single port.
 //!
 //! The fake Scribe treats the audio bytes as the transcript, so the debug page can "speak" by sending text.
@@ -12,7 +12,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::extract::{Multipart, State};
+use axum::extract::{Multipart, Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -41,6 +41,17 @@ async fn stt(mut mp: Multipart) -> Json<Value> {
         }
     }
     Json(json!({"language_code": "en", "language_probability": 1.0, "text": text, "words": []}))
+}
+
+/// nav-api's `GET /maps`: one fake place.
+async fn maps() -> Json<Value> {
+    Json(json!([{"map_id": "itnig", "place": "Itnig (fake)", "nodes": 3, "edges": 2}]))
+}
+
+/// nav-api's `GET /maps/{map}`: the same three places on any map id, so a phone can pick any.
+async fn map(Path(map): Path<String>) -> Json<Value> {
+    Json(json!({"map_id": map, "place": map, "nodes": [
+        {"id": "n2", "name": "drinks area"}, {"id": "n7", "name": "kitchen"}, {"id": "n8", "name": "stage"}]}))
 }
 
 /// The fake walk: start, corridor, then the destination.
@@ -132,6 +143,8 @@ async fn main() -> std::io::Result<()> {
         goal: String::new(),
     }));
     let fakes = Router::new()
+        .route("/maps", get(maps))
+        .route("/maps/{map}", get(map))
         .route("/maps/{map}/localize", post(localize))
         .route("/maps/{map}/route", post(route))
         .route("/control", get(get_control).post(set_control))

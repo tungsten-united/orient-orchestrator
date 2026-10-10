@@ -10,7 +10,7 @@ use bytes::Bytes;
 use futures::stream::{BoxStream, StreamExt, TryStreamExt};
 use regex::Regex;
 use reqwest::multipart::{Form, Part};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value, json};
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -22,21 +22,38 @@ const CANCEL_WORDS: [&str; 3] = ["cancel", "stop", "never mind"];
 const MAX_INSTRUCTION_CHARS: usize = 240;
 const MAX_LOCALIZE_FRAMES: usize = 4;
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Route {
-    pub route_id: String,
-    pub start_step_id: String,
+/// The place a phone chose: a map published on nav-api, and the spots on it the user can ask for.
+#[derive(Clone)]
+pub struct Place {
+    pub map_id: String,
     pub destinations: Vec<Destination>,
 }
 
-/// A place the user can ask for. `destination_id` is its node on the navigation engine's map.
-#[derive(Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
+/// A spot the user can ask for: a node of the map, by its name.
+#[derive(Clone)]
 pub struct Destination {
     pub destination_id: String,
     pub label: String,
-    pub aliases: Vec<String>,
+}
+
+impl Place {
+    /// Every node of a nav-api map (`GET /maps/{map_id}`) is a destination, by its name.
+    pub fn from_map(map: &Value) -> Option<Place> {
+        let destinations = map["nodes"]
+            .as_array()?
+            .iter()
+            .filter_map(|n| {
+                Some(Destination {
+                    destination_id: n["id"].as_str()?.to_string(),
+                    label: n["name"].as_str()?.to_string(),
+                })
+            })
+            .collect();
+        Some(Place {
+            map_id: map["map_id"].as_str()?.to_string(),
+            destinations,
+        })
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -138,6 +155,7 @@ pub struct Ask {
 /// Who a nav-api call is for: sent as X-Client-Id, X-Session-Id and X-Request-Id, so nav-api's log joins the trace.
 #[derive(Clone, Debug, Default)]
 pub struct Caller {
+    pub map: String, // the client's map
     pub client: String,
     pub session: Option<String>,
     pub request: String,
@@ -197,7 +215,7 @@ pub fn tally(votes: &mut VecDeque<Vote>, vote: Vote, n: usize) -> usize {
 pub struct Pipeline {
     http: reqwest::Client,
     pub nav_url: String,
-    nav_map: String,
+    pub default_map: String, // NAV_MAP_ID: the map of a phone that doesn't choose one
     nav_token: String,
     nav_trust: String,
     pub nav_loop: NavLoop,
@@ -237,13 +255,9 @@ fn says(text: &str, phrase: &str) -> bool {
 pub fn command_question(destinations: &[Destination]) -> Value {
     let mut criteria = serde_json::Map::new();
     for d in destinations {
-        let examples = d.aliases.join(", ");
         criteria.insert(
             d.destination_id.clone(),
-            json!(format!(
-                "Wants to go to the {}, for example: {examples}.",
-                d.label
-            )),
+            json!(format!("Wants to go to the {}.", d.label)),
         );
     }
     criteria.insert(
@@ -298,7 +312,7 @@ pub fn match_command(transcript: &str, destinations: &[Destination]) -> Command 
     }
     destinations
         .iter()
-        .find(|d| says(&text, &d.label) || d.aliases.iter().any(|a| says(&text, a)))
+        .find(|d| says(&text, &d.label))
         .map_or(Command::Unsupported, |d| {
             Command::Start(d.destination_id.clone())
         })
@@ -365,7 +379,7 @@ impl Pipeline {
         Pipeline {
             http: reqwest::Client::new(),
             nav_url: env("NAV_URL", "http://localhost:8001"),
-            nav_map: env("NAV_MAP_ID", "itnig"),
+            default_map: env("NAV_MAP_ID", "itnig"),
             nav_token: env("NAV_API_TOKEN", ""),
             nav_trust: env("NAV_TRUST", "observed"),
             nav_loop: NavLoop {
@@ -440,9 +454,7 @@ impl Pipeline {
             .text("tag_audio_events", "false")
             .part("file", file);
         for d in destinations {
-            for term in std::iter::once(&d.label).chain(&d.aliases) {
-                form = form.text("keyterms", term.clone());
-            }
+            form = form.text("keyterms", d.label.clone());
         }
         let r: Value = self
             .http
@@ -521,21 +533,58 @@ impl Pipeline {
         }
     }
 
-    /// A request to nav-api for the venue's map, with the caller's ids and the token when one is set.
+    /// A request to nav-api for the caller's map, with the caller's ids and the token when one is set.
     fn nav(&self, path: &str, caller: &Caller) -> reqwest::RequestBuilder {
         let mut r = self
             .http
-            .post(format!("{}/maps/{}/{path}", self.nav_url, self.nav_map))
+            .post(format!("{}/maps/{}/{path}", self.nav_url, caller.map))
             .header("X-Client-Id", &caller.client)
             .header("X-Request-Id", &caller.request);
         if let Some(session) = &caller.session {
             r = r.header("X-Session-Id", session);
         }
+        self.authed(r)
+    }
+
+    fn authed(&self, r: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         if self.nav_token.is_empty() {
             r
         } else {
             r.bearer_auth(&self.nav_token)
         }
+    }
+
+    /// `GET /maps/{map_id}`: the place a phone chose, or None when nav-api has no such map.
+    pub async fn place(&self, map_id: &str) -> Result<Option<Place>, BoxError> {
+        let r = self
+            .authed(self.http.get(format!("{}/maps/{map_id}", self.nav_url)))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?;
+        if r.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let map: Value = r.error_for_status()?.json().await?;
+        Ok(Some(
+            Place::from_map(&map).ok_or("map: no map_id or nodes")?,
+        ))
+    }
+
+    /// `GET /maps`: the published maps, as `{mapId, place}` for the phone to choose from, the default map first.
+    pub async fn maps(&self) -> Result<Vec<Value>, BoxError> {
+        let mut maps: Vec<Value> = self
+            .authed(self.http.get(format!("{}/maps", self.nav_url)))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        maps.sort_by_key(|m| m["map_id"] != self.default_map.as_str()); // stable: nav-api's order otherwise
+        Ok(maps
+            .iter()
+            .map(|m| json!({"mapId": m["map_id"], "place": m["place"]}))
+            .collect())
     }
 
     /// `POST /maps/{map}/localize`: which node the frames show (at most 4, oldest first, each with the phone's motion
@@ -901,12 +950,37 @@ mod tests {
         );
     }
 
+    /// A small map as nav-api serves it (`GET /maps/{map_id}`), with the fields `Place` reads.
+    fn place() -> Place {
+        Place::from_map(&json!({"map_id": "itnig", "place": "Itnig", "nodes": [
+            {"id": "n2", "name": "drinks area", "kind": "landmark"},
+            {"id": "n7", "name": "kitchen", "kind": "room"},
+            {"id": "n8", "name": "stage", "kind": "destination"},
+        ]}))
+        .unwrap()
+    }
+
+    #[test]
+    fn every_node_of_the_map_is_a_destination_by_its_name() {
+        let p = place();
+        assert_eq!(p.map_id, "itnig");
+        let names: Vec<(&str, &str)> = p
+            .destinations
+            .iter()
+            .map(|d| (d.destination_id.as_str(), d.label.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [("n2", "drinks area"), ("n7", "kitchen"), ("n8", "stage")]
+        );
+        assert!(Place::from_map(&json!({"detail": "not found"})).is_none());
+    }
+
     #[test]
     fn match_command_uses_whole_words() {
-        let route: Route = serde_json::from_str(include_str!("route.json")).unwrap();
-        let d = &route.destinations;
+        let d = &place().destinations;
         assert_eq!(
-            match_command("Take me to the coffee", d),
+            match_command("Take me to the drinks area", d),
             Command::Start("n2".into())
         );
         assert_eq!(
@@ -919,11 +993,11 @@ mod tests {
 
     #[test]
     fn jev_command_is_one_choice_and_low_confidence_asks_again() {
-        let route: Route = serde_json::from_str(include_str!("route.json")).unwrap();
-        let d = &route.destinations;
+        let d = &place().destinations;
         let q = command_question(d);
         let options: Vec<&String> = q["criteria"].as_object().unwrap().keys().collect();
         assert_eq!(options, ["cancel", "n2", "n7", "n8", "unsupported"]);
+        assert_eq!(q["criteria"]["n7"], "Wants to go to the kitchen.");
         // Answer shape from https://docs.typesafe.ai/introduction/quickstart
         let answer = |choice: &str, confidence: f64| json!({"type": "choice", "choice": choice, "confidence": confidence, "probabilities": {}});
         assert_eq!(

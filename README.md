@@ -89,7 +89,7 @@ Then, in GitHub, create the environment `staging` (Settings > Environments) with
 
 ### Session logs
 
-Staging prints every trace entry to Cloud Logging. Each entry has `clientId`, `sessionId`, `requestId`, `kind`, the step's outcome and timings, and which app produced it: `commit`, `version` and `routeId`. Each entry also has a `message`, the summary line in the service's Logs tab (`[c2cd8407] frame @corridor · turn → “Turn left.”`), and a `severity`, so errors stand out. Lines the web app posts to `POST /v1/logs` read `[<id>] web · <event> <detail>`. Find them in Logs Explorer, or:
+Staging prints every trace entry to Cloud Logging. Each entry has `clientId`, `sessionId`, `requestId`, `kind`, the step's outcome and timings, and which app produced it: `commit`, `version` and `mapId`. Each entry also has a `message`, the summary line in the service's Logs tab (`[c2cd8407] frame @corridor · turn → “Turn left.”`), and a `severity`, so errors stand out. Lines the web app posts to `POST /v1/logs` read `[<id>] web · <event> <detail>`. Find them in Logs Explorer, or:
 
 ```bash
 # One session
@@ -121,7 +121,7 @@ To require approval before each release, add required reviewers to the `staging`
 | --- | --- | --- |
 | `BIND` | `0.0.0.0:8000` | Listen address |
 | `NAV_URL` | `http://localhost:8001` | nav-api base, e.g. `https://nav-api-613464313064.europe-southwest1.run.app/api/v1`: `POST /maps/{map}/localize`, `POST /maps/{map}/route` |
-| `NAV_MAP_ID` | `itnig` | The venue's map on nav-api |
+| `NAV_MAP_ID` | `itnig` | The map of a phone that doesn't choose one (`POST /v1/clients` with `{"mapId"}`) |
 | `NAV_API_TOKEN` | empty | nav-api's token (Secret Manager `nav-api-token`), sent as a bearer token. Server only |
 | `NAV_TRUST` | `observed` | Edge trust for `route`: `verified`, `observed` or `any` |
 | `NAV_ENGINE` | `nav-engine` | Engine name shown in debug and trace |
@@ -144,7 +144,6 @@ To require approval before each release, add required reviewers to the `staging`
 | `NAV_MARGIN` | `0.04` | A localization votes only when its best node leads the second by this much |
 | `NAV_LOCATE_LOST_MARGIN` | `0.06` | While locating, a `lost` result (all scores low) votes for its best node when it leads by this much (`1` turns it off) |
 | `NAV_LOST_MS` | `6000` | Following, no result pointing at the hop for this long (by the frames' `capturedAt`) starts a new navigation: every one `lost`, or led by a node off the hop. A time, so the frame rate doesn't change it |
-| `ROUTE_PATH` | built-in `src/route.json` | Route definition |
 | `MAX_INPUT_AGE_MS` | `3000` | Reject older input |
 | `TRACE_PATH` | unset | Also append the run trace as JSON lines to this file |
 | `ALLOW_ORIGINS` | `*` | CORS origins, comma separated |
@@ -160,7 +159,7 @@ To require approval before each release, add required reviewers to the `staging`
 - `src/server.rs`, `src/main.rs`: axum HTTP server.
 - `tests/e2e.rs`: end-to-end test over HTTP and SSE, against the native server or any deployment (`E2E_BASE`).
 - `src/pipeline.rs`: model calls (STT, Jev, navigation), path validation, the worker's comparison rule, and sentence templates.
-- `src/route.json`: the Itnig destinations. Each `destinationId` is a node id on nav-api's `itnig` map (n2 Drinks area, n7 Kitchen, n8 Stage).
+- Places: every node of the phone's map on nav-api, by its name (`GET /maps/{map_id}`, read when the client is created). `GET /v1/maps` lists the maps a phone can choose.
 
 ## How Jev is used
 

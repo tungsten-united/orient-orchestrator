@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::pipeline::{
-    self, Ask, Audio, Caller, Command, Destination, Output, Pipeline, Route, Vars, Vote, var,
+    self, Ask, Audio, Caller, Command, Destination, Output, Pipeline, Place, Vars, Vote, var,
 };
 
 const AUDIO_TYPES: [&str; 2] = ["audio/webm", "audio/mp4"];
@@ -90,7 +90,6 @@ impl Limits {
 }
 
 pub struct AppState {
-    pub route: Route,
     pub pipeline: Pipeline,
     pub limits: Limits,
     trace_path: Option<String>,
@@ -105,9 +104,8 @@ pub type App = Arc<AppState>;
 pub type ClientRef = Arc<Mutex<Client>>;
 
 impl AppState {
-    pub fn new(route: Route, pipeline: Pipeline, get: Vars) -> Self {
+    pub fn new(pipeline: Pipeline, get: Vars) -> Self {
         AppState {
-            route,
             pipeline,
             limits: Limits::from_vars(get),
             trace_path: get("TRACE_PATH"),
@@ -137,14 +135,6 @@ impl AppState {
             .filter(|(t, _)| (from..=to).contains(t))
             .map(|(_, text)| text.clone())
             .collect()
-    }
-
-    fn destination(&self, id: &str) -> &Destination {
-        self.route
-            .destinations
-            .iter()
-            .find(|d| d.destination_id == id)
-            .expect("validated destination")
     }
 }
 
@@ -304,7 +294,8 @@ pub struct Client {
     trace_path: Option<String>,
     trace_stdout: bool,
     sse_logs: bool,
-    stamp: Value, // which app produced the trace: commit, version, route
+    stamp: Value, // which app produced the trace: commit, version, map
+    place: Place, // the map the phone chose and the destinations on it
 }
 
 pub fn lock(c: &ClientRef) -> MutexGuard<'_, Client> {
@@ -312,6 +303,15 @@ pub fn lock(c: &ClientRef) -> MutexGuard<'_, Client> {
 }
 
 impl Client {
+    fn destination(&self, id: &str) -> Destination {
+        self.place
+            .destinations
+            .iter()
+            .find(|d| d.destination_id == id)
+            .expect("validated destination")
+            .clone()
+    }
+
     fn phase(&self) -> &'static str {
         match &self.session {
             _ if self.stopped => "stopped",
@@ -458,6 +458,14 @@ pub fn api_error(status: u16, code: &'static str, message: impl Into<String>) ->
     }
 }
 
+/// nav-api didn't answer: worth trying again.
+pub fn navigation_unavailable(message: impl Into<String>) -> ApiError {
+    ApiError {
+        retryable: true,
+        ..api_error(503, "navigation_unavailable", message)
+    }
+}
+
 pub fn bad_request(message: impl ToString) -> ApiError {
     api_error(400, "bad_request", message.to_string())
 }
@@ -548,8 +556,8 @@ pub fn client_logs(app: &App, body: &[u8]) -> ApiResult<Vec<Value>> {
         .collect())
 }
 
-/// A new client with its token. The response body is the contract's `POST /v1/clients` reply.
-pub fn create_client(app: &App, id: String) -> (ClientRef, Value) {
+/// A new client with its token, on the place it chose. The response body is the contract's `POST /v1/clients` reply.
+pub fn create_client(app: &App, id: String, place: Place) -> (ClientRef, Value) {
     let token = format!(
         "{}{}",
         uuid::Uuid::new_v4().simple(),
@@ -571,12 +579,13 @@ pub fn create_client(app: &App, id: String) -> (ClientRef, Value) {
         sse_logs: app.debug_page,
         stamp: json!({
             "commit": app.commit, "version": env!("CARGO_PKG_VERSION"),
-            "routeId": app.route.route_id,
+            "mapId": place.map_id.clone(),
         }),
+        place,
     };
     c.log(None, "client", json!({}));
-    let destinations: Vec<Value> = app
-        .route
+    let destinations: Vec<Value> = c
+        .place
         .destinations
         .iter()
         .map(|d| json!({"destinationId": d.destination_id, "label": d.label}))
@@ -587,7 +596,7 @@ pub fn create_client(app: &App, id: String) -> (ClientRef, Value) {
         "generation": c.generation,
         "serverTime": now_ms(),
         "phase": c.phase(),
-        "route": {"routeId": app.route.route_id, "startStepId": app.route.start_step_id, "destinations": destinations},
+        "route": {"routeId": c.place.map_id, "destinations": destinations},
         "limits": app.limits,
     });
     (Arc::new(Mutex::new(c)), response)
@@ -677,13 +686,12 @@ fn parse_meta(raw: Option<String>) -> ApiResult<Meta> {
         .map_err(|e| bad_request(format!("meta: {e}")))
 }
 
-fn ask_again(route: &Route, reason: &str) -> String {
+fn ask_again(destinations: &[Destination], reason: &str) -> String {
     match reason {
         "empty" => "I didn't hear anything. Where would you like to go?".to_string(),
         "unsupported" => {
             // Only here are the options useful: the user asked for somewhere we cannot guide to.
-            let places = route
-                .destinations
+            let places = destinations
                 .iter()
                 .map(|d| d.label.as_str())
                 .collect::<Vec<_>>()
@@ -880,16 +888,16 @@ async fn handle_input(
     (audio, content_type): (Vec<u8>, String),
     frame: Option<Vec<u8>>,
 ) {
-    let (started_gen, phase) = {
+    let (started_gen, phase, destinations) = {
         let c = lock(&cref);
-        (c.generation, c.phase())
+        (c.generation, c.phase(), c.place.destinations.clone())
     };
     let rid = Some(m.request_id.as_str());
     let mut timings = serde_json::Map::new();
     let t = now_ms();
     let transcript = match app
         .pipeline
-        .transcribe(audio, &content_type, &app.route.destinations)
+        .transcribe(audio, &content_type, &destinations)
         .await
     {
         Ok(text) => text.trim().to_string(),
@@ -911,7 +919,7 @@ async fn handle_input(
         (Command::Empty, Value::Null)
     } else {
         app.pipeline
-            .command(&transcript, phase, &app.route.destinations)
+            .command(&transcript, phase, &destinations)
             .await
     };
     timings.insert("command".into(), json!(now_ms() - t));
@@ -940,7 +948,8 @@ async fn handle_input(
                     .as_ref()
                     .is_some_and(|s| s.destination.destination_id == id);
             if !same_action {
-                c.start_session(app.destination(&id).clone());
+                let destination = c.destination(&id);
+                c.start_session(destination);
             } else if let Some(s) = c.session.as_mut() {
                 s.previous = None;
             }
@@ -956,7 +965,7 @@ async fn handle_input(
             c.emit(
                 "needs_input",
                 rid,
-                json!({"reason": reason, "text": ask_again(&app.route, reason)}),
+                json!({"reason": reason, "text": ask_again(&destinations, reason)}),
             );
         }
     }
@@ -1081,7 +1090,7 @@ fn advance(
 async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
     let (started_gen, dest, mut nav, frames, steps, previous, last_spoken_at, caller) = {
         let mut c = lock(cref);
-        let (generation, client) = (c.generation, c.id.clone());
+        let (generation, client, map) = (c.generation, c.id.clone(), c.place.map_id.clone());
         let Some(s) = c.session.as_mut() else { return };
         let unsent: Vec<&(Meta, Vec<u8>)> = s
             .frames
@@ -1099,6 +1108,7 @@ async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
             .collect();
         s.sent_upto = sent_upto;
         let caller = Caller {
+            map,
             client,
             session: Some(s.id.clone()),
             request: m.request_id.clone(),
@@ -1440,19 +1450,33 @@ mod tests {
         assert_eq!(tuned["frameGapMs"], 250);
     }
 
+    fn place() -> Place {
+        Place::from_map(&json!({"map_id": "glories-basement", "nodes": [{"id": "n1", "name": "Main entrance"}]}))
+            .unwrap()
+    }
+
+    #[test]
+    fn should_tell_the_phone_the_places_on_its_map() {
+        let app = Arc::new(AppState::new(Pipeline::from_vars(&|_| None), &|_| None));
+        let (_, response) = create_client(&app, "c1".into(), place());
+        assert_eq!(
+            response["route"],
+            json!({"routeId": "glories-basement", "destinations": [{"destinationId": "n1", "label": "Main entrance"}]})
+        );
+    }
+
     #[test]
     fn should_stamp_every_trace_entry_with_the_app_version() {
         let get = |k: &str| (k == "GIT_SHA").then(|| "abc123".to_string());
-        let route: Route = serde_json::from_str(include_str!("route.json")).unwrap();
-        let app = Arc::new(AppState::new(route, Pipeline::from_vars(&get), &get));
-        let (cref, _) = create_client(&app, "c1".into());
+        let app = Arc::new(AppState::new(Pipeline::from_vars(&get), &get));
+        let (cref, _) = create_client(&app, "c1".into(), place());
         let entry = &trace(&cref)["entries"][0];
         assert_eq!(
-            (&entry["commit"], &entry["version"], &entry["routeId"]),
+            (&entry["commit"], &entry["version"], &entry["mapId"]),
             (
                 &json!("abc123"),
                 &json!(env!("CARGO_PKG_VERSION")),
-                &json!(app.route.route_id)
+                &json!("glories-basement")
             )
         );
     }
@@ -1461,9 +1485,8 @@ mod tests {
     fn should_stream_trace_entries_as_log_events_only_with_the_debug_page() {
         for (debug, expected) in [(true, Some("log")), (false, None)] {
             let get = |k: &str| (debug && k == "DEBUG_PAGE").then(|| "1".to_string());
-            let route: Route = serde_json::from_str(include_str!("route.json")).unwrap();
-            let app = Arc::new(AppState::new(route, Pipeline::from_vars(&get), &get));
-            let (cref, _) = create_client(&app, "c1".into());
+            let app = Arc::new(AppState::new(Pipeline::from_vars(&get), &get));
+            let (cref, _) = create_client(&app, "c1".into(), place());
             let mut c = lock(&cref);
             let mut rx = c.events.subscribe();
             c.log(Some("r1"), "stop", json!({}));
@@ -1530,8 +1553,7 @@ mod tests {
     #[test]
     fn should_turn_a_client_log_batch_into_structured_entries() {
         let get = |k: &str| (k == "GIT_SHA").then(|| "abc123".to_string());
-        let route: Route = serde_json::from_str(include_str!("route.json")).unwrap();
-        let app = Arc::new(AppState::new(route, Pipeline::from_vars(&get), &get));
+        let app = Arc::new(AppState::new(Pipeline::from_vars(&get), &get));
         let body = br#"{"deviceId":"d1","clientId":"c1","entries":[
             {"at":5,"level":"error","event":"permission_denied","detail":"NotAllowedError"},
             {"at":6,"level":"nonsense","event":"x"}]}"#;
@@ -1548,8 +1570,7 @@ mod tests {
     #[test]
     fn should_reject_oversized_or_malformed_client_logs() {
         let get = |_: &str| None;
-        let route: Route = serde_json::from_str(include_str!("route.json")).unwrap();
-        let app = Arc::new(AppState::new(route, Pipeline::from_vars(&get), &get));
+        let app = Arc::new(AppState::new(Pipeline::from_vars(&get), &get));
         assert_eq!(
             client_logs(&app, &vec![b' '; 20_000]).unwrap_err().status,
             413
