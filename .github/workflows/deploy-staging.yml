@@ -8,11 +8,11 @@ on:
       fake_nav:
         description: Use the fake navigation engine (off = NAV_URL from the staging environment)
         type: boolean
-        default: true
+        default: false
       fake_speech:
         description: Use fake ElevenLabs (off = the real ElevenLabs API)
         type: boolean
-        default: true
+        default: false
 
 concurrency:
   group: staging

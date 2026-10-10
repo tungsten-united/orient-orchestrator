@@ -35,8 +35,8 @@ The page drives the real API. With "Speak guidance aloud" it plays guidance thro
 
 Staging is released by hand: **Actions > Deploy staging > Run workflow**, then pick a branch or tag. The workflow runs the CI checks, builds one image (`Dockerfile`: the server, plus the fakes), pushes it to Artifact Registry, and deploys two Cloud Run services:
 
-- `orient-fakes-staging`: the fake navigation engine and STT. Only when the **fakes** box is ticked (the default).
-- `orient-orchestrator-staging`: the server with `DEBUG_PAGE=1`, pointed at the fakes. Untick `fake_nav` to use the `staging` environment's `NAV_URL`, and `fake_speech` to use the real ElevenLabs API. Share `<url>/debug` with the team. `/v1/health` shows the deployed commit.
+- `orient-fakes-staging`: the fake navigation engine and STT. Only when `fake_nav` or `fake_speech` is ticked (both are off by default).
+- `orient-orchestrator-staging`: the server with `DEBUG_PAGE=1`. By default it uses the `staging` environment's `NAV_URL` (nav-api, with the token named by `NAV_API_SECRET`) and the real ElevenLabs API. Tick `fake_nav` or `fake_speech` to point it at the fakes instead. Share `<url>/debug` with the team. `/v1/health` shows the deployed commit.
 
 Both services are public. Anyone with the URL can use the debug page and change the fake answers. Each release drops the clients in memory: connected phones get 404 and start a new client.
 
