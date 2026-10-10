@@ -337,7 +337,7 @@ impl Client {
                 "transcript": null, "command": null, "engine": null, "framesSent": null,
                 "action": null, "confidence": null, "observation": null, "spoke": false,
                 "text": null, "timingsMs": {}, "dropped": null, "error": null,
-                "localize": null, "route": null, "quietReason": null,
+                "localize": null, "route": null, "quietReason": null, "jev": null,
             }),
             merge(&self.stamp, fields),
         );
@@ -852,8 +852,8 @@ async fn handle_input(
     let t = now_ms();
     // The phone heard the app (its own speaker, or another phone's) rather than a person: ask again.
     let echo = pipeline::is_echo(&transcript, &app.spoken_near(m.captured_at));
-    let cmd = if transcript.is_empty() || echo {
-        Command::Empty
+    let (cmd, jev) = if transcript.is_empty() || echo {
+        (Command::Empty, Value::Null)
     } else {
         app.pipeline
             .command(&transcript, phase, &app.route.destinations)
@@ -873,6 +873,7 @@ async fn handle_input(
     }
     let mut fields = json!({"transcript": transcript, "command": cmd.name()});
     fields["timingsMs"] = json!(timings);
+    fields["jev"] = jev;
     if echo {
         fields["dropped"] = json!("echo");
     }
@@ -1013,13 +1014,16 @@ async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
 
     let now = now_ms();
     let (mut speak, mut reason) = app.pipeline.should_speak(&output, previous.as_ref());
+    let mut jev_answer = Value::Null;
     if reason == "changed" && output.action != "arrived" && !app.pipeline.jev_api_key.is_empty() {
         let t = now_ms();
         let state = json!({
             "destination": dest.label, "previous": previous, "new": output,
             "msSinceLastSpoken": now - last_spoken_at,
         });
-        if !app.pipeline.worth_saying(state).await {
+        let (worth, answer) = app.pipeline.worth_saying(state).await;
+        jev_answer = answer;
+        if !worth {
             (speak, reason) = (false, "not_worth_saying");
         }
         timings.insert("jev".into(), json!(now_ms() - t));
@@ -1081,7 +1085,7 @@ async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
         "frame",
         merge(
             &base,
-            json!({"action": output.action, "spoke": speak, "text": text, "timingsMs": timings, "quietReason": (!speak).then_some(reason)}),
+            json!({"action": output.action, "spoke": speak, "text": text, "timingsMs": timings, "quietReason": (!speak).then_some(reason), "jev": jev_answer}),
         ),
     );
 }

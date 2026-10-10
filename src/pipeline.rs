@@ -158,6 +158,16 @@ pub fn command_question(destinations: &[Destination]) -> Value {
     })
 }
 
+/// What the trace keeps of a Jev Choice answer.
+fn jev_trace(answer: &Value) -> Value {
+    json!({
+        "source": "jev",
+        "choice": answer["choice"],
+        "confidence": answer["confidence"],
+        "probabilities": answer["probabilities"],
+    })
+}
+
 /// Low confidence means "ask again", never a guess.
 pub fn parse_command(answer: &Value, destinations: &[Destination], min_confidence: f64) -> Command {
     if !answer["confidence"]
@@ -356,31 +366,45 @@ impl Pipeline {
         Ok(r.bytes_stream().map_err(BoxError::from).boxed())
     }
 
+    /// The command and Jev's answer behind it, as a small trace: its choice, confidence and probabilities.
     pub async fn command(
         &self,
         transcript: &str,
         phase: &str,
         destinations: &[Destination],
-    ) -> Command {
+    ) -> (Command, Value) {
         if self.jev_api_key.is_empty() {
-            return match_command(transcript, destinations);
+            let command = match_command(transcript, destinations);
+            return (command, json!({"source": "keywords"}));
         }
         let state = json!({"spokenRequest": transcript, "sessionPhase": phase});
         let questions = json!({"command": command_question(destinations)});
         match self.jev(state, questions, 3000).await {
             Ok(answers) => {
-                parse_command(&answers["command"], destinations, self.jev_min_confidence)
+                let answer = &answers["command"];
+                let command = parse_command(answer, destinations, self.jev_min_confidence);
+                (command, jev_trace(answer))
             }
-            Err(_) => Command::Unclear,
+            Err(e) => (
+                Command::Unclear,
+                json!({"source": "jev", "error": e.to_string()}),
+            ),
         }
     }
 
     /// Asks Jev whether a changed direction is worth saying. Any failure says it.
-    pub async fn worth_saying(&self, state: Value) -> bool {
+    /// The second value is Jev's answer for the trace.
+    pub async fn worth_saying(&self, state: Value) -> (bool, Value) {
         let questions = json!({"speak": speak_question()});
         match self.jev(state, questions, 2000).await {
-            Ok(answers) => parse_speak(&answers["speak"], self.jev_min_confidence),
-            Err(_) => true,
+            Ok(answers) => {
+                let answer = &answers["speak"];
+                (
+                    parse_speak(answer, self.jev_min_confidence),
+                    jev_trace(answer),
+                )
+            }
+            Err(e) => (true, json!({"source": "jev", "error": e.to_string()})),
         }
     }
 
@@ -784,5 +808,19 @@ mod tests {
         assert!(!is_echo("turn left at the kitchen", &spoken));
         assert!(!is_echo("kitchen", &spoken));
         assert!(!is_echo("", &spoken));
+    }
+
+    #[test]
+    fn should_keep_jev_choice_confidence_and_probabilities_for_the_trace() {
+        let answer = json!({
+            "type": "choice", "choice": "n8", "confidence": 0.9,
+            "probabilities": {"n8": 0.9, "unsupported": 0.1},
+        });
+        let kept = jev_trace(&answer);
+        assert_eq!(kept["source"], "jev");
+        assert_eq!(kept["choice"], "n8");
+        assert_eq!(kept["confidence"], 0.9);
+        assert_eq!(kept["probabilities"]["unsupported"], 0.1);
+        assert!(kept.get("type").is_none());
     }
 }
