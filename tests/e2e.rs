@@ -491,7 +491,7 @@ async fn sessions_frames_worker_and_stop() {
     assert_eq!(frames_seen(), 1);
     assert_eq!(
         h.nav.lock().unwrap().route_request,
-        json!({"start": "start", "goal": "n2", "trust": "observed"})
+        json!({"start": "start", "goal": "n2", "trust": "any"})
     );
     assert_eq!(route_calls(), 1);
     {
@@ -1113,4 +1113,91 @@ async fn should_guide_on_the_map_the_phone_chose() {
     assert_eq!(n.route_request["goal"], "n4");
     let stt = h.eleven.lock().unwrap().stt_request.clone();
     assert_eq!(stt["keyterms"], json!(["Main entrance", "Ticket machines"]));
+}
+
+/// Located, but nav-api has no route from there (a map walked one way only): the phone hears that once, not
+/// "Please hold still", and `route` is not asked again from the same node; from another node it is.
+#[tokio::test]
+async fn should_say_once_that_there_is_no_way_from_here_and_ask_again_only_from_elsewhere() {
+    let h = harness().await;
+    let c: Value = h
+        .http
+        .post(format!("{}/v1/clients", h.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let (cid, token) = (
+        c["clientId"].as_str().unwrap(),
+        c["clientToken"].as_str().unwrap(),
+    );
+    let url = |p: &str| format!("{}/v1/clients/{cid}/{p}", h.base);
+    let mut rx = Events::open(&h.http, format!("{}?token={token}", url("events"))).await;
+    rx.next().await;
+    {
+        let mut n = h.nav.lock().unwrap();
+        n.found = confirmed("n7");
+        n.route = json!({"found": false, "hops": []});
+    }
+    let form = Form::new()
+        .text("meta", meta("u1", 1, 0, now_ms()))
+        .part("audio", audio("take me to the drinks area"))
+        .part("frame", jpeg());
+    let r = h
+        .http
+        .post(url("inputs"))
+        .bearer_auth(token)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 202);
+    assert_eq!(rx.next().await["phase"], "navigating");
+    let ev = rx.next().await;
+    assert_eq!(
+        (ev["type"].as_str(), ev["text"].as_str()),
+        (
+            Some("guidance"),
+            Some("I can't find a way to the drinks area from here.")
+        )
+    );
+    // Still at the kitchen, every result confirming it: quiet, and no new route request.
+    let mut seq = 1;
+    for _ in 0..3 {
+        let form = Form::new()
+            .text("meta", meta(&format!("f{seq}"), 2, seq, now_ms()))
+            .part("frame", jpeg());
+        let r = h
+            .http
+            .post(url("frames"))
+            .bearer_auth(token)
+            .multipart(form)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 202);
+        seq += 1;
+        let ev = rx.next().await;
+        assert_eq!(
+            (ev["type"].as_str(), ev["quietReason"].as_str()),
+            (Some("heartbeat"), Some("unchanged"))
+        );
+    }
+    assert_eq!(h.nav.lock().unwrap().route_calls, 1);
+
+    // Somewhere else, there is a way: asked again, and guidance starts.
+    {
+        let mut n = h.nav.lock().unwrap();
+        n.found = confirmed("corridor");
+        n.route = path(&[("corridor", "n2", "turn_left", None)]);
+    }
+    let (ev, _, _) = frames_until_news(&h, &mut rx, &url("frames"), token, 2, seq).await;
+    assert_eq!(ev["text"], "Turn left.");
+    let n = h.nav.lock().unwrap();
+    assert_eq!(
+        (n.route_calls, n.route_request["start"].as_str()),
+        (2, Some("corridor"))
+    );
 }

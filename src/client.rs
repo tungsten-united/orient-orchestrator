@@ -189,6 +189,7 @@ struct Nav {
     hop: usize,
     votes: VecDeque<Vote>,
     off_hop_since: Option<i64>, // following: capturedAt of the first of the results in a row not pointing at the hop
+    no_route_from: Option<String>, // the node nav-api had no route from: `route` is asked again only from another one
 }
 
 impl Nav {
@@ -1165,6 +1166,7 @@ async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
     let arrived = matches!(&mv, Move::Located(n) | Move::Reached(n) if n == goal);
     if let Move::Located(n) = &mv
         && !arrived
+        && nav.no_route_from.as_ref() != Some(n)
     {
         let t = now_ms();
         match app.pipeline.path(n, goal, &caller).await {
@@ -1174,6 +1176,8 @@ async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
                 if route["found"] == true && hops.first().is_some_and(|h| h["source"] == n.as_str())
                 {
                     (nav.path, nav.hop) = (Some(hops), 0);
+                } else {
+                    nav.no_route_from = Some(n.clone());
                 }
                 base = merge(&base, json!({"route": route}));
             }
@@ -1185,6 +1189,9 @@ async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
         Some(path) => app
             .pipeline
             .hop_output(&path[nav.hop], nav.node.as_deref().unwrap_or("")),
+        None if nav.no_route_from.is_some() && nav.no_route_from == nav.node => {
+            Output::no_route(nav.node.as_deref().unwrap_or(""), &dest.label)
+        }
         None => Output::wait(nav.node.as_deref(), true), // locating: "Please hold still"
     };
 

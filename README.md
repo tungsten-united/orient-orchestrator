@@ -123,7 +123,7 @@ To require approval before each release, add required reviewers to the `staging`
 | `NAV_URL` | `http://localhost:8001` | nav-api base, e.g. `https://nav-api-613464313064.europe-southwest1.run.app/api/v1`: `POST /maps/{map}/localize`, `POST /maps/{map}/route` |
 | `NAV_MAP_ID` | `itnig` | The map of a phone that doesn't choose one (`POST /v1/clients` with `{"mapId"}`) |
 | `NAV_API_TOKEN` | empty | nav-api's token (Secret Manager `nav-api-token`), sent as a bearer token. Server only |
-| `NAV_TRUST` | `observed` | Edge trust for `route`: `verified`, `observed` or `any` |
+| `NAV_TRUST` | `any` | Edge trust for `route`: `verified`, `observed` (the walked direction) or `any` (walked, either way) |
 | `NAV_ENGINE` | `nav-engine` | Engine name shown in debug and trace |
 | `TYPESAFE_API_KEY` | empty | Key for TypeSafe's Jev: the Command step and speak or stay quiet. Server only. Empty: keyword matching, every change spoken |
 | `JEV_URL` | `https://api.typesafe.ai/v1/systemone` | System One endpoint |

@@ -100,6 +100,16 @@ impl Output {
         }
     }
 
+    /// Located, but nav-api has no route from here: said once, not "hold still", which would blame the camera.
+    pub fn no_route(step: &str, destination_label: &str) -> Self {
+        Output {
+            instruction: Some(format!(
+                "I can't find a way to the {destination_label} from here."
+            )),
+            ..Output::wait(Some(step), false)
+        }
+    }
+
     pub fn arrived(step: &str) -> Self {
         Output {
             action: "arrived".into(),
@@ -381,7 +391,7 @@ impl Pipeline {
             nav_url: env("NAV_URL", "http://localhost:8001"),
             default_map: env("NAV_MAP_ID", "itnig"),
             nav_token: env("NAV_API_TOKEN", ""),
-            nav_trust: env("NAV_TRUST", "observed"),
+            nav_trust: env("NAV_TRUST", "any"),
             nav_loop: NavLoop {
                 burst: env("NAV_BURST", "1").parse().expect("NAV_BURST"),
                 k: env("NAV_VOTE_K", "3").parse().expect("NAV_VOTE_K"),
