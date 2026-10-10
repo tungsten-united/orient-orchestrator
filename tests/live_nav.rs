@@ -30,7 +30,7 @@ async fn should_locate_and_route_on_the_live_nav_api() {
         .expect("localize");
     assert!(["confirmed", "uncertain", "lost"].contains(&found["status"].as_str().unwrap()));
     assert!(found["candidates"].is_array() && found["margin"].is_number());
-    let _ = locate_vote(&found, p.nav_loop.margin);
+    let _ = locate_vote(&found, p.nav_loop.margin, p.nav_loop.locate_lost_margin);
 
     // One route from the entrance to the drinks area, then a localize on its first hop.
     let route = p.path("n1", "n2", &caller).await.expect("route");

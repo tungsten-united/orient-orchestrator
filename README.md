@@ -140,6 +140,7 @@ To require approval before each release, add required reviewers to the `staging`
 | `NAV_VOTE_K` | `3` | Votes needed among the last `NAV_VOTE_N` localizations to locate the user, reach the hop's target, or call them lost |
 | `NAV_VOTE_N` | `4` | Window of the votes |
 | `NAV_MARGIN` | `0.04` | A localization votes only when its best node leads the second by this much |
+| `NAV_LOCATE_LOST_MARGIN` | `0.06` | While locating, a `lost` result (all scores low) votes for its best node when it leads by this much (`1` turns it off) |
 | `NAV_LOST_CALLS` | `10` | `lost` results in a row, while following, that start a new navigation |
 | `ROUTE_PATH` | built-in `src/route.json` | Route definition |
 | `MAX_INPUT_AGE_MS` | `3000` | Reject older input |

@@ -100,6 +100,7 @@ pub struct NavLoop {
     pub n: usize,     // NAV_VOTE_N: ... among the last n localizations
     pub margin: f64, // NAV_MARGIN: a result votes only when its best node leads the second by this much
     pub lost_calls: u32, // NAV_LOST_CALLS: `lost` results in a row, while following, that start a new navigation
+    pub locate_lost_margin: f64, // NAV_LOCATE_LOST_MARGIN: locating, a `lost` result votes when its best leads by this
 }
 
 /// One localization's vote in the navigation loop.
@@ -142,24 +143,33 @@ pub struct Caller {
     pub request: String,
 }
 
-/// The best node of a localization, when it leads the second by `margin` and the user can be there: the result
-/// isn't `lost`, and nav-api doesn't mark it as farther than they walked (`plausible: false`).
-fn leader(found: &Value, margin: f64) -> Option<&str> {
+/// The best node of a localization, when it leads the second by `margin` (`lost_margin` for a `lost` result,
+/// None: a `lost` result never leads) and the user can be there: nav-api doesn't mark it as farther than they walked
+/// (`plausible: false`).
+fn leader(found: &Value, margin: f64, lost_margin: Option<f64>) -> Option<&str> {
     let best = found["best"].as_str().filter(|n| !n.is_empty())?;
     let top = &found["candidates"][0];
     let too_far = top["node"] == best && top["plausible"] == false;
     let lead = found["margin"].as_f64().unwrap_or(0.0);
-    (found["status"] != "lost" && lead >= margin && !too_far).then_some(best)
+    let needed = if found["status"] == "lost" {
+        lost_margin?
+    } else {
+        margin
+    };
+    (lead >= needed && !too_far).then_some(best)
 }
 
-/// Locating: the leading node gets a vote.
-pub fn locate_vote(found: &Value, margin: f64) -> Vote {
-    leader(found, margin).map_or(Vote::Abstain, |n| Vote::At(n.into()))
+/// Locating: the leading node gets a vote. A `lost` result (every score low) votes too when its best node leads by
+/// `lost_margin`: live frames often score under nav-api's lost score while the same node keeps leading (Itnig,
+/// 2026-10-10: the kitchen led 25 results in a row, all `lost`, and the user waited 17 s). The K-of-N agreement still
+/// decides, and following never counts a `lost` result.
+pub fn locate_vote(found: &Value, margin: f64, lost_margin: f64) -> Vote {
+    leader(found, margin, Some(lost_margin)).map_or(Vote::Abstain, |n| Vote::At(n.into()))
 }
 
 /// Following the hop `source -> target`: has the user reached the target, or are they somewhere else?
 pub fn follow_vote(found: &Value, source: &str, target: &str, margin: f64) -> Vote {
-    match leader(found, margin) {
+    match leader(found, margin, None) {
         Some(n) if n == target => Vote::Target,
         Some(n) if n != source => Vote::Elsewhere,
         _ => Vote::Abstain,
@@ -359,6 +369,9 @@ impl Pipeline {
                 n: env("NAV_VOTE_N", "4").parse().expect("NAV_VOTE_N"),
                 margin: env("NAV_MARGIN", "0.04").parse().expect("NAV_MARGIN"),
                 lost_calls: env("NAV_LOST_CALLS", "10").parse().expect("NAV_LOST_CALLS"),
+                locate_lost_margin: env("NAV_LOCATE_LOST_MARGIN", "0.06")
+                    .parse()
+                    .expect("NAV_LOCATE_LOST_MARGIN"),
             },
             engine: env("NAV_ENGINE", "nav-engine"),
             eleven: ElevenLabs {
@@ -738,21 +751,33 @@ mod tests {
         };
         // low scores are fine: what counts is which node leads
         assert_eq!(
-            locate_vote(&found("uncertain", "n4", 0.05), 0.04),
+            locate_vote(&found("uncertain", "n4", 0.05), 0.04, 0.06),
             Vote::At("n4".into())
         );
         assert_eq!(
-            locate_vote(&found("uncertain", "n4", 0.02), 0.04),
+            locate_vote(&found("uncertain", "n4", 0.02), 0.04, 0.06),
             Vote::Abstain
         );
-        assert_eq!(locate_vote(&found("lost", "n4", 0.2), 0.04), Vote::Abstain);
+        // a `lost` result votes while locating only with a clearer lead; following, never
         assert_eq!(
-            locate_vote(&json!({"status": "lost", "candidates": []}), 0.04),
+            locate_vote(&found("lost", "n4", 0.05), 0.04, 0.06),
+            Vote::Abstain
+        );
+        assert_eq!(
+            locate_vote(&found("lost", "n4", 0.07), 0.04, 0.06),
+            Vote::At("n4".into())
+        );
+        assert_eq!(
+            follow_vote(&found("lost", "n5", 0.2), "n4", "n5", 0.04),
+            Vote::Abstain
+        );
+        assert_eq!(
+            locate_vote(&json!({"status": "lost", "candidates": []}), 0.04, 0.06),
             Vote::Abstain
         );
         let mut too_far = found("uncertain", "n5", 0.1);
         too_far["candidates"][0]["plausible"] = json!(false);
-        assert_eq!(locate_vote(&too_far, 0.04), Vote::Abstain);
+        assert_eq!(locate_vote(&too_far, 0.04, 0.06), Vote::Abstain);
         assert_eq!(follow_vote(&too_far, "n4", "n5", 0.04), Vote::Abstain);
         assert_eq!(
             follow_vote(&found("uncertain", "n5", 0.05), "n4", "n5", 0.04),

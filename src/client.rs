@@ -1024,7 +1024,7 @@ fn advance(
     cfg: &pipeline::NavLoop,
 ) -> (Vote, usize, Move) {
     let Some(path) = &nav.path else {
-        let vote = pipeline::locate_vote(found, cfg.margin);
+        let vote = pipeline::locate_vote(found, cfg.margin, cfg.locate_lost_margin);
         let count = pipeline::tally(&mut nav.votes, vote.clone(), cfg.n);
         let at = match (confirmed, &vote) {
             (Some(n), _) => Some(n),
@@ -1267,6 +1267,7 @@ mod tests {
         n: 4,
         margin: 0.04,
         lost_calls: 10,
+        locate_lost_margin: 0.06,
     };
 
     #[test]
