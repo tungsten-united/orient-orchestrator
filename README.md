@@ -108,7 +108,7 @@ To require approval before each release, add required reviewers to the `staging`
 | `JEV_URL` | `https://api.typesafe.ai/v1/systemone` | System One endpoint |
 | `JEV_MODEL` | `jev-latest` | Jev model |
 | `JEV_MIN_CONFIDENCE` | `0.5` | Below this, the command is treated as unclear and the user is asked again |
-| `ELEVENLABS_API_KEY` | empty | ElevenLabs key (`xi-api-key`). Server only. Required unless `ELEVENLABS_URL` points at fakes: utterances return 503 without it |
+| `ELEVENLABS_API_KEY` | empty | ElevenLabs key (`xi-api-key`). Server only. Required unless `ELEVENLABS_URL` points at fakes: inputs return 503 without it |
 | `ELEVENLABS_URL` | `https://api.elevenlabs.io` | ElevenLabs base URL. Point it at `examples/fakes.rs` for local runs and staging |
 | `ELEVENLABS_STT_MODEL` | `scribe_v2` | Speech-to-text model |
 | `ELEVENLABS_TTS_MODEL` | `eleven_flash_v2_5` | Text-to-speech model, the lowest latency |
@@ -121,7 +121,7 @@ To require approval before each release, add required reviewers to the `staging`
 | `REPEAT_MS` | `7000` | The worker repeats unchanged guidance after this |
 | `TRACE_PATH` | unset | Also append the run trace as JSON lines to this file |
 | `ALLOW_ORIGINS` | `*` | CORS origins, comma separated |
-| `DEBUG_PAGE` | unset | Serve the debug page at `/debug` (local runs and staging) |
+| `DEBUG_PAGE` | unset | Serve the debug page at `/debug` and stream every trace entry as a `log` SSE event (local runs and staging) |
 | `GIT_SHA` | unset | Commit shown by `/v1/health` and stamped on every trace entry; set by the staging deploy |
 | `TRACE_STDOUT` | unset | Also print every trace entry as one JSON line (stored by Cloud Logging on Cloud Run); on in staging |
 
@@ -139,7 +139,7 @@ To require approval before each release, add required reviewers to the `staging`
 
 [Jev](https://docs.typesafe.ai/introduction) is a decision model. It takes a `state` and typed questions (Choice, Score, Noul) and returns calibrated answers. It does not generate text.
 
-- **Command:** one Choice question per utterance. The state is `{spokenRequest, sessionPhase}`. The options are each destination ID plus `cancel` and `unsupported`. If `confidence` is below `JEV_MIN_CONFIDENCE`, the user is asked again.
+- **Command:** one Choice question per input. The state is `{spokenRequest, sessionPhase}`. The options are each destination ID plus `cancel` and `unsupported`. If `confidence` is below `JEV_MIN_CONFIDENCE`, the user is asked again.
 - **Worker:** compares outputs in code. If that proves too rigid, this is a natural Noul question ("should the user be told something now?").
 - **Sentences:** fixed templates, because Jev doesn't write sentences.
 

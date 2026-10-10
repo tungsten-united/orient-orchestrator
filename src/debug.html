@@ -250,8 +250,8 @@ async function say(text) {
   const parts = [['audio', new Blob([text], { type: 'audio/webm' }), 'a.webm']];
   if ($('#say-frame').checked) parts.push(['frame', jpeg(), 'f.jpg']);
   const { requestId, fd } = multipart('u', parts);
-  const { status, data } = await post('utterances', fd);
-  addRequest(`utterance ${requestId} “${text}” (g${JSON.parse(fd.get('meta')).generation})`, status, data.error?.code);
+  const { status, data } = await post('inputs', fd);
+  addRequest(`input ${requestId} “${text}” (g${JSON.parse(fd.get('meta')).generation})`, status, data.error?.code);
 }
 
 async function frame() {
@@ -291,7 +291,7 @@ async function pollTrace() {
       const { entries } = await r.json();
       $('#trace').innerHTML = entries.slice(-80).reverse().map((t) => {
         const cls = t.dropped ? 'dropped' : t.error ? 'err' : t.spoke ? 'spoke' : '';
-        const what = t.kind === 'utterance' ? `${esc(t.transcript ?? '')} → ${t.command ?? ''}` : t.spoke ? `“${esc(t.text)}”` : t.action ?? '';
+        const what = t.kind === 'input' ? `${esc(t.transcript ?? '')} → ${t.command ?? ''}` : t.spoke ? `“${esc(t.text)}”` : t.action ?? '';
         const ms = t.timingsMs ?? {};
         return `<tr class="${cls}"><td class="mono">${clock(t.at - C.offset)}</td><td>${t.kind}</td><td class="mono">${t.requestId ?? ''}</td>` +
           `<td>${sessionChip(t.sessionId)}</td><td class="mono">${t.generation}</td><td>${t.routeStepId ?? ''}</td><td>${t.framesSent ?? ''}</td>` +

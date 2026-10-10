@@ -218,6 +218,7 @@ pub struct Client {
     entries: Vec<Value>,
     trace_path: Option<String>,
     trace_stdout: bool,
+    sse_logs: bool,
     stamp: Value, // which app produced the trace: commit, version, route
 }
 
@@ -320,6 +321,9 @@ impl Client {
         {
             let _ = writeln!(f, "{entry}");
         }
+        if self.sse_logs {
+            self.emit("log", request_id, json!({"kind": kind, "entry": entry}));
+        }
         self.entries.push(entry);
     }
 
@@ -396,6 +400,7 @@ pub fn create_client(app: &App, id: String) -> (ClientRef, Value) {
         entries: Vec::new(),
         trace_path: app.trace_path.clone(),
         trace_stdout: app.trace_stdout,
+        sse_logs: app.debug_page,
         stamp: json!({
             "commit": app.commit, "version": env!("CARGO_PKG_VERSION"),
             "routeId": app.route.route_id,
@@ -472,7 +477,7 @@ fn accept(app: &App, c: &mut Client, m: &Meta, kind: &str) -> ApiResult<()> {
     Ok(())
 }
 
-/// The multipart parts of an utterance or frame upload, each already checked with `check_part`.
+/// The multipart parts of an input or frame upload, each already checked with `check_part`.
 #[derive(Default)]
 pub struct Parts {
     pub meta: Option<String>,
@@ -549,7 +554,7 @@ pub fn events(app: &App, cref: &ClientRef) -> impl Stream<Item = String> + use<>
     })
 }
 
-pub fn utterance(app: &App, cref: &ClientRef, parts: Parts) -> ApiResult<Value> {
+pub fn input(app: &App, cref: &ClientRef, parts: Parts) -> ApiResult<Value> {
     let m = parse_meta(parts.meta)?;
     let mut c = lock(cref);
     if let Some(r) = c.responses.get(&m.request_id) {
@@ -565,8 +570,8 @@ pub fn utterance(app: &App, cref: &ClientRef, parts: Parts) -> ApiResult<Value> 
         e.retryable = true;
         return Err(e);
     }
-    accept(app, &mut c, &m, "utterance")?;
-    spawn(handle_utterance(
+    accept(app, &mut c, &m, "input")?;
+    spawn(handle_input(
         app.clone(),
         cref.clone(),
         m.clone(),
@@ -693,7 +698,7 @@ pub fn trace(cref: &ClientRef) -> Value {
     json!({"clientId": c.id, "entries": c.entries})
 }
 
-async fn handle_utterance(
+async fn handle_input(
     app: App,
     cref: ClientRef,
     m: Meta,
@@ -712,7 +717,7 @@ async fn handle_utterance(
         Err(e) => {
             let mut c = lock(&cref);
             if c.generation == started_gen {
-                c.log(rid, "utterance", json!({"error": format!("stt: {e}")}));
+                c.log(rid, "input", json!({"error": format!("stt: {e}")}));
                 let data = json!({"code": "upstream_unavailable", "stage": "stt", "text": UNAVAILABLE, "retryable": true});
                 c.halt("error", rid, data);
             }
@@ -735,14 +740,14 @@ async fn handle_utterance(
     if c.generation != started_gen {
         c.log(
             rid,
-            "utterance",
+            "input",
             json!({"transcript": transcript, "dropped": "stale_generation"}),
         );
         return;
     }
     c.log(
         rid,
-        "utterance",
+        "input",
         json!({"transcript": transcript, "command": cmd.name(), "timingsMs": timings}),
     );
     match cmd {
@@ -943,6 +948,28 @@ mod tests {
                 &json!(app.route.route_id)
             )
         );
+    }
+
+    #[test]
+    fn should_stream_trace_entries_as_log_events_only_with_the_debug_page() {
+        for (debug, expected) in [(true, Some("log")), (false, None)] {
+            let get = |k: &str| (debug && k == "DEBUG_PAGE").then(|| "1".to_string());
+            let route: Route = serde_json::from_str(include_str!("route.json")).unwrap();
+            let app = Arc::new(AppState::new(route, Pipeline::from_vars(&get), &get));
+            let (cref, _) = create_client(&app, "c1".into());
+            let mut c = lock(&cref);
+            let mut rx = c.events.subscribe();
+            c.log(Some("r1"), "stop", json!({}));
+            let got = rx.try_recv().ok();
+            assert_eq!(got.as_ref().map(|e| e["type"].as_str().unwrap()), expected);
+            if let Some(ev) = got {
+                assert_eq!(
+                    (&ev["kind"], &ev["entry"]["kind"]),
+                    (&json!("stop"), &json!("stop"))
+                );
+                assert_eq!(ev["requestId"], "r1");
+            }
+        }
     }
 
     #[test]
