@@ -66,6 +66,12 @@ gcloud iam service-accounts add-iam-policy-binding $SA --project $PROJECT --role
 echo "GCP_WIF_PROVIDER=$POOL/providers/github"
 ```
 
+Store the TypeSafe key in a Secret Manager secret named `TYPESAFE_API_KEY`, readable by the runtime service account (`roles/secretmanager.secretAccessor`). Every release mounts it:
+
+```bash
+read -rs K && printf %s "$K" | gcloud secrets create TYPESAFE_API_KEY --data-file=- --project $PROJECT; unset K
+```
+
 Then, in GitHub, create the environment `staging` (Settings > Environments) with these variables:
 
 | Variable | Value |
@@ -78,7 +84,6 @@ Then, in GitHub, create the environment `staging` (Settings > Environments) with
 | `ELEVENLABS_SECRET` | optional: name of a Secret Manager secret holding the ElevenLabs key, for releases without fakes |
 | `ELEVENLABS_VOICE_ID` | optional: the ElevenLabs voice for `GET /speech` |
 | `ALLOW_ORIGINS` | optional: the web app's staging origin (default `*`) |
-| `TYPESAFE_SECRET` | optional: name of a Secret Manager secret holding the TypeSafe key. Grant the Cloud Run runtime service account `roles/secretmanager.secretAccessor` on it |
 
 ### Session logs
 
