@@ -387,7 +387,11 @@ pub fn client_logs(app: &App, body: &[u8]) -> ApiResult<Vec<Value>> {
     const MAX_BODY: usize = 16 * 1024;
     const MAX_ENTRIES: usize = 50;
     if body.len() > MAX_BODY {
-        return Err(api_error(413, "payload_too_large", "Log batch is too large."));
+        return Err(api_error(
+            413,
+            "payload_too_large",
+            "Log batch is too large.",
+        ));
     }
     let v: Value = serde_json::from_slice(body).map_err(|_| bad_request("Body is not JSON."))?;
     let entries = v
@@ -1049,9 +1053,15 @@ mod tests {
         let get = |_: &str| None;
         let route: Route = serde_json::from_str(include_str!("route.json")).unwrap();
         let app = Arc::new(AppState::new(route, Pipeline::from_vars(&get), &get));
-        assert_eq!(client_logs(&app, &vec![b' '; 20_000]).unwrap_err().status, 413);
+        assert_eq!(
+            client_logs(&app, &vec![b' '; 20_000]).unwrap_err().status,
+            413
+        );
         assert_eq!(client_logs(&app, b"nope").unwrap_err().status, 400);
-        assert_eq!(client_logs(&app, br#"{"entries":"x"}"#).unwrap_err().status, 400);
+        assert_eq!(
+            client_logs(&app, br#"{"entries":"x"}"#).unwrap_err().status,
+            400
+        );
     }
 
     #[test]
