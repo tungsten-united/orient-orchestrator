@@ -568,7 +568,9 @@ fn ask_again(route: &Route, reason: &str) -> String {
                 .map(|d| d.label.as_str())
                 .collect::<Vec<_>>()
                 .join(" or the ");
-            format!("I can't guide you there yet. I can take you to the {places}. Where would you like to go?")
+            format!(
+                "I can't guide you there yet. I can take you to the {places}. Where would you like to go?"
+            )
         }
         _ => "Sorry, I didn't understand. Where would you like to go?".to_string(),
     }
