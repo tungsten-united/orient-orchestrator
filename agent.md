@@ -84,7 +84,7 @@ printf '%s' "$ELEVENLABS_API_KEY" | gcloud secrets versions add ELEVENLABS_API_K
 2. `frames` pushes each frame into the session buffer via `submit_frame`. Only the newest frame is evaluated (`pending`).
 3. A single `worker` task per client and generation (`Client.worker` holds its generation) loops over pending frames. A worker from an older generation exits at its next turn. `evaluate` sends the whole buffer to the VLA, then `pipeline.validate` turns the answer into an `Output`. The step can only move to the next step on the route. Anything else becomes `wait`, and low confidence becomes an uncertain `wait`.
 4. `pipeline.should_speak` compares the output with the session's previous output. A different output becomes a `guidance` event with a template sentence. The same output becomes a quiet `heartbeat`, except for a reminder after `REPEAT_MS`.
-5. `GET /speech` (`client::speech`) turns any text the phone speaks into ElevenLabs Flash audio, streamed through and cached in memory by text once a stream completes. Failures are a 503, and the phone falls back to browser TTS, so speech never blocks guidance.
+5. `GET /speech` (`client::speech`) turns any text the phone speaks into ElevenLabs Flash audio, with that text echoed in the `X-Speech-Text` header, streamed through and cached in memory by text once a stream completes. Failures are a 503, and the phone falls back to browser TTS, so speech never blocks guidance.
 
 **Jev** (TypeSafe, `docs.typesafe.ai`) is a decision model. It answers typed questions (Choice, Score, Noul) and never generates text. That is why sentences are templates and the speak-or-stay-quiet rule is code. The Jev call has not been run against the live API yet.
 

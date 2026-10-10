@@ -562,6 +562,7 @@ async fn should_stream_speech_from_elevenlabs_and_cache_it_by_text() {
     let r = speech(token, "Turn left.").await.unwrap();
     assert_eq!(r.status(), 200);
     assert_eq!(r.headers()["content-type"], "audio/mpeg");
+    assert_eq!(r.headers()["x-speech-text"], "Turn left.");
     assert_eq!(r.text().await.unwrap(), "mp3:Turn left.");
     let mut tts = h.eleven.lock().unwrap().tts_request.clone();
     if std::env::var("E2E_BASE").is_ok() {
@@ -578,6 +579,7 @@ async fn should_stream_speech_from_elevenlabs_and_cache_it_by_text() {
 
     // Same text again: from the cache, no ElevenLabs call.
     let r = speech(token, "Turn left.").await.unwrap();
+    assert_eq!(r.headers()["x-speech-text"], "Turn left.");
     assert_eq!(r.text().await.unwrap(), "mp3:Turn left.");
     assert_eq!(calls(), 1);
 

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Multipart, Path, Query, State};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -114,6 +114,18 @@ async fn events(
         .into_response())
 }
 
+const SPEECH_TEXT: HeaderName = HeaderName::from_static("x-speech-text");
+
+/// Percent-encodes UTF-8 text for a header value, readable with `decodeURIComponent`.
+fn percent_encode(text: &str) -> String {
+    text.bytes()
+        .map(|b| match b {
+            b' ' | b'!'..=b'~' if b != b'%' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 /// Token in the query, like the event stream, so the phone can use it as an `<audio>` src.
 async fn speech(
     State(srv): State<Srv>,
@@ -122,9 +134,13 @@ async fn speech(
 ) -> ApiResult<Response> {
     get_client(&srv, &id, q.get("token").map_or("", String::as_str))?;
     let text = q.get("text").cloned().unwrap_or_default();
+    let spoken = percent_encode(&text);
     let audio = client::speech(&srv.app, text).await?;
     Ok((
-        [(header::CONTENT_TYPE, "audio/mpeg")],
+        [
+            (header::CONTENT_TYPE, "audio/mpeg".to_string()),
+            (SPEECH_TEXT, spoken),
+        ],
         Body::from_stream(audio),
     )
         .into_response())
@@ -217,7 +233,8 @@ pub fn router(app: App) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(allow_origin)
         .allow_methods([Method::GET, Method::POST])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+        .expose_headers([SPEECH_TEXT]);
     let mut routes = Router::new();
     if app.debug_page {
         // Local runs and staging only: drives the API and shows events and the trace live. See examples/fakes.rs.
@@ -242,4 +259,13 @@ pub fn router(app: App) -> Router {
         .route("/v1/clients/{id}/trace", get(trace))
         .layer(cors)
         .with_state(srv)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn should_percent_encode_non_ascii_and_percent_only() {
+        assert_eq!(super::percent_encode("Turn left."), "Turn left.");
+        assert_eq!(super::percent_encode("Café 100%"), "Caf%C3%A9 100%25");
+    }
 }
