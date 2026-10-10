@@ -27,6 +27,7 @@ struct FakeNav {
     delay_ms: u64,
     frames_seen: usize,
     previous: Option<String>,
+    heading: Option<String>,
     route_request: Value,
     auth: Option<String>,
 }
@@ -65,11 +66,12 @@ async fn harness_with(with_jev: bool) -> Harness {
         post(move |headers: HeaderMap, mut mp: Multipart| {
             let fake = fake.clone();
             async move {
-                let (mut frames, mut previous) = (0, None);
+                let (mut frames, mut previous, mut heading) = (0, None, None);
                 while let Some(f) = mp.next_field().await.unwrap() {
                     match f.name() {
                         Some("images") => frames += 1,
                         Some("previous") => previous = Some(f.text().await.unwrap()),
+                        Some("heading_deg") => heading = Some(f.text().await.unwrap()),
                         _ => {}
                     }
                 }
@@ -77,6 +79,7 @@ async fn harness_with(with_jev: bool) -> Harness {
                     let mut n = fake.lock().unwrap();
                     n.frames_seen = frames;
                     n.previous = previous;
+                    n.heading = heading;
                     n.auth = headers
                         .get("authorization")
                         .and_then(|v| v.to_str().ok())
@@ -253,7 +256,9 @@ fn hop(from: &str, to: &str, step: &str, instruction: Option<&str>) -> Value {
 }
 
 fn meta(rid: &str, generation: i64, sequence: i64, captured_at: i64) -> String {
-    json!({"requestId": rid, "generation": generation, "sequence": sequence, "capturedAt": captured_at}).to_string()
+    json!({"requestId": rid, "generation": generation, "sequence": sequence, "capturedAt": captured_at,
+           "motion": {"headingDeg": 90.5, "stepCount": 3}})
+    .to_string()
 }
 
 fn jpeg() -> Part {
@@ -451,6 +456,7 @@ async fn sessions_frames_worker_and_stop() {
         (Some("Turn left."), Some("corridor"), Some("n2"))
     );
     assert_eq!(h.nav.lock().unwrap().previous.as_deref(), Some("start"));
+    assert_eq!(h.nav.lock().unwrap().heading.as_deref(), Some("90.5"));
 
     // Same action again: same session, same generation.
     assert_eq!(
@@ -462,10 +468,15 @@ async fn sessions_frames_worker_and_stop() {
         (ev["sessionId"].as_str(), ev["generation"].as_i64()),
         (Some(session1.as_str()), Some(2))
     );
+    assert_eq!(
+        post_frame("f10", 2, 10, now_ms()).await.unwrap().status(),
+        202
+    );
+    assert_eq!(rx.next().await["text"], "Turn left.");
 
     // Different action: new session, new generation, empty buffer and no previous output.
     assert_eq!(
-        say("u3", 2, 10, "take me to the kitchen")
+        say("u3", 2, 11, "take me to the kitchen")
             .await
             .unwrap()
             .status(),
@@ -479,11 +490,11 @@ async fn sessions_frames_worker_and_stop() {
         (Some(3), Some("n7"))
     );
     assert_eq!(
-        post_frame("f11", 2, 11, now_ms()).await.unwrap().status(),
+        post_frame("f12", 2, 12, now_ms()).await.unwrap().status(),
         409
     );
     assert_eq!(
-        post_frame("f12", 3, 12, now_ms()).await.unwrap().status(),
+        post_frame("f14", 3, 14, now_ms()).await.unwrap().status(),
         202
     );
     assert_eq!(rx.next().await["text"], "Turn left.");
@@ -493,7 +504,7 @@ async fn sessions_frames_worker_and_stop() {
     // Stop while the navigation model is still thinking: the late answer is never emitted.
     set_nav("n7", continue_to("corridor", "n7"), 300);
     assert_eq!(
-        post_frame("f13", 3, 13, now_ms()).await.unwrap().status(),
+        post_frame("f14", 3, 14, now_ms()).await.unwrap().status(),
         202
     );
     let r: Value = h

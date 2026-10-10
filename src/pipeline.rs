@@ -102,7 +102,6 @@ pub struct Pipeline {
     pub jev_api_key: String,
     jev_model: String,
     jev_min_confidence: f64,
-    pub repeat_ms: i64,
 }
 
 const ELEVENLABS_URL: &str = "https://api.elevenlabs.io";
@@ -269,7 +268,6 @@ impl Pipeline {
             jev_min_confidence: env("JEV_MIN_CONFIDENCE", "0.5")
                 .parse()
                 .expect("JEV_MIN_CONFIDENCE"),
-            repeat_ms: env("REPEAT_MS", "7000").parse().expect("REPEAT_MS"),
         }
     }
 
@@ -386,16 +384,21 @@ impl Pipeline {
         }
     }
 
-    /// `POST /maps/{map}/localize`: which node the session's last frames show (at most 4, oldest first).
+    /// `POST /maps/{map}/localize`: which node the session's last frames show (at most 4, oldest first),
+    /// with the phone's compass heading when it has one.
     pub async fn locate(
         &self,
         frames: Vec<Vec<u8>>,
         previous: Option<&str>,
+        heading_deg: Option<f64>,
     ) -> Result<Value, BoxError> {
         let skip = frames.len().saturating_sub(MAX_LOCALIZE_FRAMES);
         let mut form = Form::new();
         if let Some(node) = previous {
             form = form.text("previous", node.to_string());
+        }
+        if let Some(h) = heading_deg {
+            form = form.text("heading_deg", h.to_string());
         }
         for (i, frame) in frames.into_iter().skip(skip).enumerate() {
             let part = Part::bytes(frame)
@@ -475,19 +478,11 @@ impl Pipeline {
         }
     }
 
-    /// The worker's rule: speak when the output differs from the session's previous output,
-    /// or as a reminder after `repeat_ms` of the same output.
-    pub fn should_speak(
-        &self,
-        output: &Output,
-        previous: Option<&Output>,
-        last_spoken_at: i64,
-        now: i64,
-    ) -> (bool, &'static str) {
+    /// The worker's rule: speak only when the output differs from the session's previous output.
+    pub fn should_speak(&self, output: &Output, previous: Option<&Output>) -> (bool, &'static str) {
         match previous {
             None => (true, "first"),
             Some(p) if p != output => (true, "changed"),
-            _ if now - last_spoken_at >= self.repeat_ms => (true, "repeat_interval"),
             _ => (false, "unchanged"),
         }
     }
@@ -511,7 +506,7 @@ mod tests {
     #[test]
     fn should_read_settings_from_the_lookup_when_given() {
         let p = Pipeline::from_vars(&|k| (k == "NAV_URL").then(|| "http://nav".to_string()));
-        assert_eq!((p.nav_url.as_str(), p.repeat_ms), ("http://nav", 7000));
+        assert_eq!(p.nav_url, "http://nav");
     }
 
     #[test]
@@ -594,29 +589,14 @@ mod tests {
     fn speaks_only_when_output_differs_from_previous() {
         let p = Pipeline::from_vars(&|_| None);
         let prev = out("turn", Some("left"), "corridor", false);
-        assert_eq!(p.should_speak(&prev, None, 0, 1000), (true, "first"));
-        assert_eq!(
-            p.should_speak(&prev, Some(&prev), 0, 1000),
-            (false, "unchanged")
-        );
+        assert_eq!(p.should_speak(&prev, None), (true, "first"));
+        assert_eq!(p.should_speak(&prev, Some(&prev)), (false, "unchanged"));
         let right = out("turn", Some("right"), "corridor", false);
-        assert_eq!(
-            p.should_speak(&right, Some(&prev), 0, 1000),
-            (true, "changed")
-        );
+        assert_eq!(p.should_speak(&right, Some(&prev)), (true, "changed"));
         let unsure = out("wait", None, "corridor", true);
         assert!(
-            p.should_speak(
-                &unsure,
-                Some(&out("wait", None, "corridor", false)),
-                0,
-                1000
-            )
-            .0
-        );
-        assert_eq!(
-            p.should_speak(&prev, Some(&prev), 0, p.repeat_ms),
-            (true, "repeat_interval")
+            p.should_speak(&unsure, Some(&out("wait", None, "corridor", false)))
+                .0
         );
     }
 

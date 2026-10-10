@@ -122,6 +122,14 @@ struct Meta {
     sequence: i64,
     captured_at: i64,
     client_route_step_id: Option<String>,
+    motion: Option<Motion>,
+}
+
+/// The phone's motion estimate (contracts.md, "Motion"); only the heading is used.
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct Motion {
+    heading_deg: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -838,6 +846,8 @@ async fn handle_input(
                     .is_some_and(|s| s.destination.destination_id == id);
             if !same_action {
                 c.start_session(app.destination(&id).clone());
+            } else if let Some(s) = c.session.as_mut() {
+                s.previous = None;
             }
             let state = c.state();
             c.emit("state", rid, state);
@@ -924,7 +934,8 @@ async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
     });
     let t = now_ms();
     let images = frames.into_iter().map(|(_, data)| data).collect();
-    let found = match app.pipeline.locate(images, node.as_deref()).await {
+    let heading = m.motion.as_ref().and_then(|mo| mo.heading_deg);
+    let found = match app.pipeline.locate(images, node.as_deref(), heading).await {
         Ok(found) => found,
         Err(e) => return nav_failed(cref, started_gen, rid, &base, format!("localize: {e}")),
     };
@@ -950,9 +961,7 @@ async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
     };
 
     let now = now_ms();
-    let (mut speak, mut reason) =
-        app.pipeline
-            .should_speak(&output, previous.as_ref(), last_spoken_at, now);
+    let (mut speak, mut reason) = app.pipeline.should_speak(&output, previous.as_ref());
     if reason == "changed" && output.action != "arrived" && !app.pipeline.jev_api_key.is_empty() {
         let t = now_ms();
         let state = json!({

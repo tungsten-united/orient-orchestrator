@@ -9,7 +9,7 @@ It implements [`docs/contracts.md`](https://github.com/tungsten-united/project-d
 - **Client:** one phone from Start to Stop. It holds the token and the event stream (`/v1/clients/{id}/…`).
 - **Session:** one spoken action, such as going to the drinks area. The phone sends audio, the orchestrator runs speech-to-text, then Jev picks the action. A different action from the current session starts a new session, with a new `sessionId`, a new generation, an empty frame buffer and no previous output. The same action keeps the current session.
 - **Frame buffer:** each session keeps its last `NAV_FRAMES` (4) frames. nav-api's `localize` gets all of them, oldest first, as repeated `images` parts.
-- **Worker:** one per client. It evaluates the newest frame, validates the navigation answer against the route, and compares the result with the session's previous output. It sends `guidance` only when the output changed (or after `REPEAT_MS` of the same output); otherwise it sends a quiet `heartbeat`.
+- **Worker:** one per client. It evaluates the newest frame, validates the navigation answer against the route, and compares the result with the session's previous output. It sends `guidance` only when the output changed or the user asked for the same destination again; otherwise it sends a quiet `heartbeat`.
 
 ## Run
 
@@ -137,7 +137,6 @@ To require approval before each release, add required reviewers to the `staging`
 | `NAV_FRAMES` | `4` | Frames per `localize` call (nav-api takes at most 4) |
 | `ROUTE_PATH` | built-in `src/route.json` | Route definition |
 | `MAX_INPUT_AGE_MS` | `3000` | Reject older input |
-| `REPEAT_MS` | `7000` | The worker repeats unchanged guidance after this |
 | `TRACE_PATH` | unset | Also append the run trace as JSON lines to this file |
 | `ALLOW_ORIGINS` | `*` | CORS origins, comma separated |
 | `DEBUG_PAGE` | unset | Serve the debug page at `/debug` and stream every trace entry as a `log` SSE event (local runs and staging) |
