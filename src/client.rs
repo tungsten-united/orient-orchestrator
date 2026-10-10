@@ -72,7 +72,7 @@ impl Limits {
                 .parse()
                 .expect("MAX_INPUT_AGE_MS"),
             heartbeat_ms: 5000,
-            nav_frames: var(get, "NAV_FRAMES", "5").parse().expect("NAV_FRAMES"),
+            nav_frames: var(get, "NAV_FRAMES", "4").parse().expect("NAV_FRAMES"),
         }
     }
 }
@@ -111,10 +111,6 @@ impl AppState {
             .iter()
             .find(|d| d.destination_id == id)
             .expect("validated destination")
-    }
-
-    fn hint(&self, step: &str) -> &str {
-        self.route.steps.get(step).map_or("", |s| s.hint.as_str())
     }
 }
 
@@ -156,7 +152,7 @@ struct RetryBody {
 struct Session {
     id: String,
     destination: Destination,
-    step: String,
+    node: Option<String>,
     frames: VecDeque<(Meta, Vec<u8>)>, // last `nav_frames` accepted frames, oldest first
     pending: Option<Meta>,             // newest frame not evaluated yet
     previous: Option<Output>,          // the worker compares each output with this one
@@ -166,11 +162,11 @@ struct Session {
 }
 
 impl Session {
-    fn new(destination: Destination, step: String) -> Self {
+    fn new(destination: Destination, node: Option<String>) -> Self {
         Session {
             id: uuid::Uuid::new_v4().to_string(),
             destination,
-            step,
+            node,
             frames: VecDeque::new(),
             pending: None,
             previous: None,
@@ -257,7 +253,7 @@ impl Client {
             "phase": self.phase(),
             "sessionId": self.session.as_ref().map(|s| &s.id),
             "destinationId": self.session.as_ref().map(|s| &s.destination.destination_id),
-            "routeStepId": self.session.as_ref().map(|s| &s.step),
+            "routeStepId": self.session.as_ref().map(|s| &s.node),
         })
     }
 
@@ -288,12 +284,8 @@ impl Client {
     fn start_session(&mut self, destination: Destination) {
         self.reset();
         self.stopped = false;
-        // Physical position carries over when the new route passes through it.
-        let step = match &self.session {
-            Some(s) if destination.steps.contains(&s.step) => s.step.clone(),
-            _ => destination.steps[0].clone(),
-        };
-        self.session = Some(Session::new(destination, step));
+        let node = self.session.as_ref().and_then(|s| s.node.clone());
+        self.session = Some(Session::new(destination, node));
     }
 
     fn log(&mut self, request_id: Option<&str>, kind: &str, fields: Value) {
@@ -302,7 +294,7 @@ impl Client {
                 "at": now_ms(), "clientId": self.id,
                 "sessionId": self.session.as_ref().map(|s| &s.id), "generation": self.generation,
                 "requestId": request_id, "kind": kind, "clientRouteStepId": null,
-                "routeStepId": self.session.as_ref().map(|s| &s.step),
+                "routeStepId": self.session.as_ref().and_then(|s| s.node.as_ref()),
                 "destinationId": self.session.as_ref().map(|s| &s.destination.destination_id),
                 "transcript": null, "command": null, "engine": null, "framesSent": null,
                 "action": null, "confidence": null, "observation": null, "spoke": false,
@@ -891,68 +883,97 @@ async fn worker(app: App, cref: ClientRef, generation: i64) {
     }
 }
 
+/// A failed call to the navigation engine. Three in a row end guidance with an error.
+fn nav_failed(cref: &ClientRef, started_gen: i64, rid: Option<&str>, base: &Value, error: String) {
+    let mut c = lock(cref);
+    if c.generation != started_gen {
+        return;
+    }
+    let failures = c.session.as_mut().map_or(0, |s| {
+        s.nav_failures += 1;
+        s.nav_failures
+    });
+    c.log(rid, "frame", merge(base, json!({"error": error})));
+    if failures >= NAV_FAILURES_BEFORE_ERROR {
+        let data = json!({"code": "upstream_unavailable", "stage": "navigate", "text": UNAVAILABLE, "retryable": true});
+        c.halt("error", rid, data);
+    }
+}
+
+/// Where the user is (nav-api `localize`), their next move to the destination (`route`), and whether a
+/// changed move is worth saying (Jev).
 async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
-    let (started_gen, session_id, step, dest, frames) = {
+    let (started_gen, node, dest, frames, previous, last_spoken_at) = {
         let c = lock(cref);
         let Some(s) = &c.session else { return };
         (
             c.generation,
-            s.id.clone(),
-            s.step.clone(),
+            s.node.clone(),
             s.destination.clone(),
             s.frames.iter().cloned().collect::<Vec<_>>(),
+            s.previous.clone(),
+            s.last_spoken_at,
         )
     };
-    let path = &dest.steps;
+    let goal = dest.destination_id.as_str();
     let rid = Some(m.request_id.as_str());
     let mut timings = serde_json::Map::new();
     timings.insert("upload".into(), json!((now_ms() - m.captured_at).max(0)));
     let mut base = json!({
         "clientRouteStepId": m.client_route_step_id, "engine": app.pipeline.engine, "framesSent": frames.len(),
     });
-    let allowed: Vec<&String> = path
-        .iter()
-        .skip_while(|s| **s != step)
-        .skip(1)
-        .take(1)
-        .collect();
-    let meta = json!({
-        "requestId": m.request_id, "sessionId": session_id, "destinationId": dest.destination_id,
-        "routeStepId": step, "allowedNextStepIds": allowed, "stepHint": app.hint(&step),
-        "frames": frames.iter().map(|(fm, _)| json!({"requestId": fm.request_id, "capturedAt": fm.captured_at})).collect::<Vec<_>>(),
-    });
-
     let t = now_ms();
     let images = frames.into_iter().map(|(_, data)| data).collect();
-    let nav = match app.pipeline.navigate(images, meta).await {
-        Ok(nav) => nav,
-        Err(e) => {
-            let mut c = lock(cref);
-            if c.generation != started_gen {
-                return;
-            }
-            let failures = c.session.as_mut().map_or(0, |s| {
-                s.nav_failures += 1;
-                s.nav_failures
-            });
-            c.log(
-                rid,
-                "frame",
-                merge(&base, json!({"error": format!("navigate: {e}")})),
-            );
-            if failures >= NAV_FAILURES_BEFORE_ERROR {
-                let data = json!({"code": "upstream_unavailable", "stage": "navigate", "text": UNAVAILABLE, "retryable": true});
-                c.halt("error", rid, data);
-            }
-            return;
-        }
+    let found = match app.pipeline.locate(images, node.as_deref()).await {
+        Ok(found) => found,
+        Err(e) => return nav_failed(cref, started_gen, rid, &base, format!("localize: {e}")),
     };
-    timings.insert("navigate".into(), json!(now_ms() - t));
+    timings.insert("localize".into(), json!(now_ms() - t));
     base = merge(
         &base,
-        json!({"confidence": nav["confidence"], "observation": nav["observation"]}),
+        json!({"confidence": found["candidates"][0]["score"], "observation": format!("{}: {}", found["status"].as_str().unwrap_or(""), found["reason"].as_str().unwrap_or(""))}),
     );
-    let output = app.pipeline.validate(&nav, &step, path);
+    let here = app.pipeline.located(&found).or(node);
+    let output = match here.as_deref() {
+        None => Output::wait(None, true),
+        Some(n) if n == goal => Output::arrived(n),
+        Some(n) => {
+            let t = now_ms();
+            match app.pipeline.path(n, goal).await {
+                Ok(path) => {
+                    timings.insert("route".into(), json!(now_ms() - t));
+                    app.pipeline.validate(&path, n)
+                }
+                Err(e) => return nav_failed(cref, started_gen, rid, &base, format!("route: {e}")),
+            }
+        }
+    };
+
+    let now = now_ms();
+    let (mut speak, mut reason) =
+        app.pipeline
+            .should_speak(&output, previous.as_ref(), last_spoken_at, now);
+    if reason == "changed" && output.action != "arrived" && !app.pipeline.jev_api_key.is_empty() {
+        let t = now_ms();
+        let state = json!({
+            "destination": dest.label, "previous": previous, "new": output,
+            "msSinceLastSpoken": now - last_spoken_at,
+        });
+        if !app.pipeline.worth_saying(state).await {
+            (speak, reason) = (false, "not_worth_saying");
+        }
+        timings.insert("jev".into(), json!(now_ms() - t));
+    }
+    let text = speak.then(|| {
+        output.instruction.clone().unwrap_or_else(|| {
+            pipeline::template(
+                &output.action,
+                output.direction.as_deref(),
+                output.uncertain,
+                &dest.label,
+            )
+        })
+    });
 
     let mut c = lock(cref);
     if c.generation != started_gen {
@@ -971,20 +992,7 @@ async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
         .as_mut()
         .expect("same generation keeps the session");
     s.nav_failures = 0;
-    let now = now_ms();
-    let (speak, reason) =
-        app.pipeline
-            .should_speak(&output, s.previous.as_ref(), s.last_spoken_at, now);
-    // Jev answers typed questions but does not generate text, so the sentence is a template.
-    let text = speak.then(|| {
-        pipeline::template(
-            &output.action,
-            output.direction.as_deref(),
-            output.uncertain,
-            &dest.label,
-        )
-    });
-    s.step = output.step.clone();
+    s.node = output.step.clone();
     s.arrived = output.action == "arrived";
     s.previous = Some(output.clone());
     if speak {
@@ -998,7 +1006,7 @@ async fn evaluate(app: &App, cref: &ClientRef, m: Meta) {
             rid,
             json!({
                 "guidanceId": uuid::Uuid::new_v4().to_string(), "text": text, "action": output.action,
-                "direction": output.direction, "routeStepId": step, "nextRouteStepId": output.step,
+                "direction": output.direction, "routeStepId": output.step, "nextRouteStepId": output.next,
                 "uncertain": output.uncertain, "debug": {"engine": app.pipeline.engine, "timingsMs": timings},
             }),
         );

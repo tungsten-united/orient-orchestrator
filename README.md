@@ -8,14 +8,14 @@ It implements [`docs/contracts.md`](https://github.com/tungsten-united/project-d
 
 - **Client:** one phone from Start to Stop. It holds the token and the event stream (`/v1/clients/{id}/…`).
 - **Session:** one spoken action, such as going to the counter. The phone sends audio, the orchestrator runs speech-to-text, then Jev picks the action. A different action from the current session starts a new session, with a new `sessionId`, a new generation, an empty frame buffer and no previous output. The same action keeps the current session.
-- **Frame buffer:** each session keeps its last `NAV_FRAMES` (5) frames. The navigation engine gets all of them, oldest first, as repeated `frames` parts.
+- **Frame buffer:** each session keeps its last `NAV_FRAMES` (4) frames. nav-api's `localize` gets all of them, oldest first, as repeated `images` parts.
 - **Worker:** one per client. It evaluates the newest frame, validates the navigation answer against the route, and compares the result with the session's previous output. It sends `guidance` only when the output changed (or after `REPEAT_MS` of the same output); otherwise it sends a quiet `heartbeat`.
 
 ## Run
 
 ```sh
 cargo run                        # listens on 0.0.0.0:8000
-NAV_URL=http://gpu-box:8001 cargo run
+NAV_URL=https://nav-api-613464313064.europe-southwest1.run.app/api/v1 NAV_API_TOKEN=... cargo run
 cargo test
 ```
 
@@ -80,7 +80,8 @@ Then, in GitHub, create the environment `staging` (Settings > Environments) with
 | `GCP_WIF_PROVIDER` | printed by the last command |
 | `GCP_DEPLOY_SA` | `github-deploy@<project>.iam.gserviceaccount.com` |
 | `GCP_RUNTIME_SA` | service account the services run as. The deploy account needs `roles/iam.serviceAccountUser` on it |
-| `NAV_URL` | optional: the real navigation model, for releases without fakes |
+| `NAV_URL` | optional: nav-api's base (`https://nav-api-613464313064.europe-southwest1.run.app/api/v1`), for releases without fake navigation |
+| `NAV_API_SECRET` | optional: name of the Secret Manager secret holding nav-api's token (`nav-api-token`), mounted as `NAV_API_TOKEN` on releases without fake navigation |
 | `ELEVENLABS_SECRET` | optional: name of a Secret Manager secret holding the ElevenLabs key, for releases without fakes |
 | `ELEVENLABS_VOICE_ID` | optional: the ElevenLabs voice for `GET /speech` |
 | `ALLOW_ORIGINS` | optional: the web app's staging origin (default `*`) |
@@ -118,9 +119,12 @@ To require approval before each release, add required reviewers to the `staging`
 | Env var | Default | Purpose |
 | --- | --- | --- |
 | `BIND` | `0.0.0.0:8000` | Listen address |
-| `NAV_URL` | `http://localhost:8001` | Navigation engine (VLA), `POST /v1/navigate` |
-| `NAV_ENGINE` | `vla` | Engine name shown in debug and trace |
-| `TYPESAFE_API_KEY` | empty | Key for TypeSafe's Jev, used by the Command step. Server only. Empty: keyword matching |
+| `NAV_URL` | `http://localhost:8001` | nav-api base, e.g. `https://nav-api-613464313064.europe-southwest1.run.app/api/v1`: `POST /maps/{map}/localize`, `POST /maps/{map}/route` |
+| `NAV_MAP_ID` | `itnig` | The venue's map on nav-api |
+| `NAV_API_TOKEN` | empty | nav-api's token (Secret Manager `nav-api-token`), sent as a bearer token. Server only |
+| `NAV_TRUST` | `observed` | Edge trust for `route`: `verified`, `observed` or `any` |
+| `NAV_ENGINE` | `nav-engine` | Engine name shown in debug and trace |
+| `TYPESAFE_API_KEY` | empty | Key for TypeSafe's Jev: the Command step and speak or stay quiet. Server only. Empty: keyword matching, every change spoken |
 | `JEV_URL` | `https://api.typesafe.ai/v1/systemone` | System One endpoint |
 | `JEV_MODEL` | `jev-latest` | Jev model |
 | `JEV_MIN_CONFIDENCE` | `0.5` | Below this, the command is treated as unclear and the user is asked again |
@@ -130,10 +134,9 @@ To require approval before each release, add required reviewers to the `staging`
 | `ELEVENLABS_TTS_MODEL` | `eleven_flash_v2_5` | Text-to-speech model, the lowest latency |
 | `ELEVENLABS_VOICE_ID` | unset | Voice for `GET /speech`, picked in S06. Unset: `GET /speech` answers 503 and the phone uses browser TTS |
 | `SPEECH_LANGUAGE` | `en` | Sent to ElevenLabs for both directions, so Scribe skips language detection |
-| `NAV_FRAMES` | `5` | Frames per navigation call |
+| `NAV_FRAMES` | `4` | Frames per `localize` call (nav-api takes at most 4) |
 | `ROUTE_PATH` | built-in `src/route.json` | Route definition |
 | `MAX_INPUT_AGE_MS` | `3000` | Reject older input |
-| `MIN_CONFIDENCE` | `0.5` | Below this, the VLA answer becomes `wait` |
 | `REPEAT_MS` | `7000` | The worker repeats unchanged guidance after this |
 | `TRACE_PATH` | unset | Also append the run trace as JSON lines to this file |
 | `ALLOW_ORIGINS` | `*` | CORS origins, comma separated |
@@ -148,7 +151,7 @@ To require approval before each release, add required reviewers to the `staging`
 - `src/client.rs`: clients and sessions, the API operations, SSE events, and the worker.
 - `src/server.rs`, `src/main.rs`: axum HTTP server.
 - `tests/e2e.rs`: end-to-end test over HTTP and SSE, against the native server or any deployment (`E2E_BASE`).
-- `src/pipeline.rs`: model calls (STT, Jev, VLA), route validation, the worker's comparison rule, and sentence templates.
+- `src/pipeline.rs`: model calls (STT, Jev, navigation), path validation, the worker's comparison rule, and sentence templates.
 - `src/route.json`: placeholder Itnig route. Replace it once S01 freezes the real route.
 
 ## How Jev is used

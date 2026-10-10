@@ -295,7 +295,7 @@ async function pollTrace() {
         const ms = t.timingsMs ?? {};
         return `<tr class="${cls}"><td class="mono">${clock(t.at - C.offset)}</td><td>${t.kind}</td><td class="mono">${t.requestId ?? ''}</td>` +
           `<td>${sessionChip(t.sessionId)}</td><td class="mono">${t.generation}</td><td>${t.routeStepId ?? ''}</td><td>${t.framesSent ?? ''}</td>` +
-          `<td>${t.action ?? ''}</td><td>${what}</td><td>${t.dropped ?? esc(t.error ?? '')}</td><td class="mono">${ms.navigate ?? ms.command ?? ''} / ${ms.total ?? ''}</td></tr>`;
+          `<td>${t.action ?? ''}</td><td>${what}</td><td>${t.dropped ?? esc(t.error ?? '')}</td><td class="mono">${ms.localize ?? ms.command ?? ''} / ${ms.total ?? ''}</td></tr>`;
       }).join('');
     } catch { /* the server may be restarting */ }
   }

@@ -22,9 +22,13 @@ use orient_orchestrator::server;
 
 #[derive(Default)]
 struct FakeNav {
-    answer: Value,
+    found: Value,
+    route: Value,
     delay_ms: u64,
     frames_seen: usize,
+    previous: Option<String>,
+    route_request: Value,
+    auth: Option<String>,
 }
 
 /// What the fake ElevenLabs received.
@@ -40,6 +44,7 @@ struct Harness {
     http: reqwest::Client,
     nav: Arc<Mutex<FakeNav>>,
     eleven: Arc<Mutex<FakeEleven>>,
+    jev_states: Arc<Mutex<Vec<Value>>>,
 }
 
 async fn serve(router: Router, port: u16) -> String {
@@ -51,25 +56,64 @@ async fn serve(router: Router, port: u16) -> String {
     format!("http://{addr}")
 }
 
-async fn harness() -> Harness {
+/// `with_jev`: a fake TypeSafe that picks the coffee and keeps every changed direction quiet.
+async fn harness_with(with_jev: bool) -> Harness {
     let nav = Arc::new(Mutex::new(FakeNav::default()));
     let fake = nav.clone();
-    let fake_vla = Router::new().route(
-        "/v1/navigate",
-        post(move |mut mp: Multipart| {
+    let fake_nav = Router::new().route(
+        "/maps/itnig/localize",
+        post(move |headers: HeaderMap, mut mp: Multipart| {
             let fake = fake.clone();
             async move {
-                let mut frames = 0;
+                let (mut frames, mut previous) = (0, None);
                 while let Some(f) = mp.next_field().await.unwrap() {
-                    frames += usize::from(f.name() == Some("frames"));
+                    match f.name() {
+                        Some("images") => frames += 1,
+                        Some("previous") => previous = Some(f.text().await.unwrap()),
+                        _ => {}
+                    }
                 }
                 let (answer, delay) = {
                     let mut n = fake.lock().unwrap();
                     n.frames_seen = frames;
-                    (n.answer.clone(), n.delay_ms)
+                    n.previous = previous;
+                    n.auth = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .map(String::from);
+                    (n.found.clone(), n.delay_ms)
                 };
                 tokio::time::sleep(Duration::from_millis(delay)).await;
                 Json(answer)
+            }
+        }),
+    );
+    let fake = nav.clone();
+    let fake_nav = fake_nav.route(
+        "/maps/itnig/route",
+        post(move |Json(req): Json<Value>| {
+            let fake = fake.clone();
+            async move {
+                let mut n = fake.lock().unwrap();
+                n.route_request = req;
+                Json(n.route.clone())
+            }
+        }),
+    );
+    let jev_states = Arc::new(Mutex::new(Vec::new()));
+    let states = jev_states.clone();
+    let fake_jev = Router::new().route(
+        "/jev",
+        post(move |Json(body): Json<Value>| {
+            let states = states.clone();
+            async move {
+                let answer =
+                    |choice: &str| json!({"type": "choice", "choice": choice, "confidence": 0.9});
+                if body["questions"]["speak"].is_object() {
+                    states.lock().unwrap().push(body["state"].clone());
+                    return Json(json!({"answers": {"speak": answer("quiet")}}));
+                }
+                Json(json!({"answers": {"command": answer("counter")}}))
             }
         }),
     );
@@ -123,17 +167,22 @@ async fn harness() -> Harness {
     );
     let base = match std::env::var("E2E_BASE") {
         Ok(base) => {
-            serve(fake_vla, 8101).await;
+            serve(fake_nav, 8101).await;
             serve(fake_eleven, 8102).await;
             base
         }
         Err(_) => {
-            let vars = [
-                ("NAV_URL", serve(fake_vla, 0).await),
+            let mut vars = vec![
+                ("NAV_URL", serve(fake_nav, 0).await),
                 ("ELEVENLABS_URL", serve(fake_eleven, 0).await),
                 ("ELEVENLABS_API_KEY", "test-key".into()),
                 ("ELEVENLABS_VOICE_ID", "test-voice".into()),
+                ("NAV_API_TOKEN", "nav-token".into()),
             ];
+            if with_jev {
+                vars.push(("JEV_URL", format!("{}/jev", serve(fake_jev, 0).await)));
+                vars.push(("TYPESAFE_API_KEY", "test-jev-key".into()));
+            }
             let get = |k: &str| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone());
             let route: Route = serde_json::from_str(include_str!("../src/route.json")).unwrap();
             let app = Arc::new(AppState::new(route, Pipeline::from_vars(&get), &get));
@@ -145,7 +194,12 @@ async fn harness() -> Harness {
         http: reqwest::Client::new(),
         nav,
         eleven,
+        jev_states,
     }
+}
+
+async fn harness() -> Harness {
+    harness_with(false).await
 }
 
 /// Reads the SSE stream. Timer heartbeats (no quietReason) are skipped: the test does not control them.
@@ -187,6 +241,15 @@ impl Events {
     async fn next(&mut self) -> Value {
         self.recv(Duration::from_secs(5)).await.expect("event")
     }
+}
+
+fn confirmed(node: &str) -> Value {
+    json!({"status": "confirmed", "reason": "clear", "best": node, "margin": 0.1, "candidates": [{"node": node, "score": 0.7}]})
+}
+
+fn hop(from: &str, to: &str, step: &str, instruction: Option<&str>) -> Value {
+    json!({"found": true, "hops": [{"edge": "e1", "source": from, "target": to, "instruction": instruction,
+                                     "steps": [{"action": step}], "status": "observed"}]})
 }
 
 fn meta(rid: &str, generation: i64, sequence: i64, captured_at: i64) -> String {
@@ -243,11 +306,14 @@ async fn sessions_frames_worker_and_stop() {
             .multipart(form)
             .send()
     };
-    let set_nav = |answer: Value, delay_ms: u64| {
+    let set_nav = |node: &str, route: Value, delay_ms: u64| {
         let mut n = h.nav.lock().unwrap();
-        n.answer = answer;
+        n.found = confirmed(node);
+        n.route = route;
         n.delay_ms = delay_ms;
     };
+    let continue_to = |from: &str, to: &str| hop(from, to, "straight", None);
+    let turn_left = |from: &str, to: &str| hop(from, to, "turn_left", None);
     let frames_seen = || h.nav.lock().unwrap().frames_seen;
 
     // Unknown client: 404. No token: 401, also on the event stream.
@@ -291,10 +357,7 @@ async fn sessions_frames_worker_and_stop() {
     assert_eq!(r.status(), 400);
 
     // Audio with the first frame starts session 1.
-    set_nav(
-        json!({"action": "continue", "proposedNextStepId": "corridor", "confidence": 0.9}),
-        0,
-    );
+    set_nav("start", continue_to("start", "corridor"), 0);
     let form = Form::new()
         .text("meta", meta("u1", 1, 0, now_ms()))
         .part("audio", audio("take me to the coffee"))
@@ -320,6 +383,16 @@ async fn sessions_frames_worker_and_stop() {
         (Some("guidance"), Some("Keep going straight."))
     );
     assert_eq!(frames_seen(), 1);
+    assert_eq!(
+        h.nav.lock().unwrap().route_request,
+        json!({"start": "start", "goal": "counter", "trust": "observed"})
+    );
+    if std::env::var("E2E_BASE").is_err() {
+        assert_eq!(
+            h.nav.lock().unwrap().auth.as_deref(),
+            Some("Bearer nav-token")
+        );
+    }
     // Scribe got the phone's audio as is, with the contract's settings (contracts.md section 4).
     let mut stt = h.eleven.lock().unwrap().stt_request.clone();
     if std::env::var("E2E_BASE").is_err() {
@@ -345,7 +418,7 @@ async fn sessions_frames_worker_and_stop() {
         422
     );
 
-    // Same output as before: the worker stays quiet. The buffer caps at 5 frames.
+    // Same output as before: the worker stays quiet. The buffer caps at 4 frames.
     for seq in 2..8 {
         assert_eq!(
             post_frame(&format!("f{seq}"), 2, seq, now_ms())
@@ -360,18 +433,24 @@ async fn sessions_frames_worker_and_stop() {
             (Some("heartbeat"), Some("unchanged"))
         );
     }
-    assert_eq!(frames_seen(), 5);
+    assert_eq!(frames_seen(), 4);
 
     // A different output is spoken.
-    set_nav(
-        json!({"action": "turn", "direction": "left", "proposedNextStepId": "corridor", "confidence": 0.9}),
-        0,
-    );
+    set_nav("corridor", turn_left("corridor", "counter"), 0);
     assert_eq!(
         post_frame("f8", 2, 8, now_ms()).await.unwrap().status(),
         202
     );
-    assert_eq!(rx.next().await["text"], "Turn left.");
+    let ev = rx.next().await;
+    assert_eq!(
+        (
+            ev["text"].as_str(),
+            ev["routeStepId"].as_str(),
+            ev["nextRouteStepId"].as_str()
+        ),
+        (Some("Turn left."), Some("corridor"), Some("counter"))
+    );
+    assert_eq!(h.nav.lock().unwrap().previous.as_deref(), Some("start"));
 
     // Same action again: same session, same generation.
     assert_eq!(
@@ -409,12 +488,10 @@ async fn sessions_frames_worker_and_stop() {
     );
     assert_eq!(rx.next().await["text"], "Turn left.");
     assert_eq!(frames_seen(), 1);
+    assert_eq!(h.nav.lock().unwrap().route_request["start"], "corridor");
 
     // Stop while the navigation model is still thinking: the late answer is never emitted.
-    set_nav(
-        json!({"action": "turn", "direction": "right", "proposedNextStepId": "bathroom", "confidence": 0.9}),
-        300,
-    );
+    set_nav("bathroom", continue_to("corridor", "bathroom"), 300);
     assert_eq!(
         post_frame("f13", 3, 13, now_ms()).await.unwrap().status(),
         202
@@ -478,7 +555,7 @@ async fn sessions_frames_worker_and_stop() {
         .text()
         .await
         .unwrap();
-    assert!(t.contains("\"framesSent\":5") && !t.contains(token));
+    assert!(t.contains("\"framesSent\":4") && !t.contains(token));
 }
 
 async fn local_server(vars: &[(&str, &str)]) -> String {
@@ -617,4 +694,79 @@ async fn should_answer_503_for_speech_when_no_voice_is_configured() {
         .await
         .unwrap();
     assert_eq!(r.status(), 503);
+}
+
+#[tokio::test]
+async fn should_keep_a_changed_direction_quiet_when_jev_says_it_is_not_worth_saying() {
+    if std::env::var("E2E_BASE").is_ok() {
+        return;
+    }
+    let h = harness_with(true).await;
+    let c: Value = h
+        .http
+        .post(format!("{}/v1/clients", h.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let (cid, token) = (
+        c["clientId"].as_str().unwrap(),
+        c["clientToken"].as_str().unwrap(),
+    );
+    let url = |p: &str| format!("{}/v1/clients/{cid}/{p}", h.base);
+    let mut rx = Events::open(&h.http, format!("{}?token={token}", url("events"))).await;
+    rx.next().await;
+    {
+        let mut n = h.nav.lock().unwrap();
+        n.found = confirmed("start");
+        n.route = hop(
+            "start",
+            "corridor",
+            "straight",
+            Some("Walk 10 m along the wall."),
+        );
+    }
+    let form = Form::new()
+        .text("meta", meta("u1", 1, 0, now_ms()))
+        .part("audio", audio("coffee"))
+        .part("frame", jpeg());
+    let r = h
+        .http
+        .post(url("inputs"))
+        .bearer_auth(token)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 202);
+    assert_eq!(rx.next().await["phase"], "navigating");
+    assert_eq!(rx.next().await["text"], "Walk 10 m along the wall.");
+    assert!(h.jev_states.lock().unwrap().is_empty());
+
+    h.nav.lock().unwrap().route["hops"][0]["instruction"] = json!("Keep walking along the wall.");
+    let form = Form::new()
+        .text("meta", meta("f1", 2, 1, now_ms()))
+        .part("frame", jpeg());
+    let r = h
+        .http
+        .post(url("frames"))
+        .bearer_auth(token)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 202);
+    let ev = rx.next().await;
+    assert_eq!(
+        (ev["type"].as_str(), ev["quietReason"].as_str()),
+        (Some("heartbeat"), Some("not_worth_saying"))
+    );
+    let state = h.jev_states.lock().unwrap()[0].clone();
+    assert_eq!(
+        state["previous"]["instruction"],
+        "Walk 10 m along the wall."
+    );
+    assert_eq!(state["new"]["instruction"], "Keep walking along the wall.");
 }

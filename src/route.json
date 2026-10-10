@@ -1,24 +1,16 @@
 {
   "routeId": "itnig-demo",
   "startStepId": "start",
-  "steps": {
-    "start": { "hint": "Entrance. Corridor straight ahead." },
-    "corridor": { "hint": "Coffee machine on the left, counter ahead." },
-    "counter": { "hint": "Coffee counter, staff behind it." },
-    "bathroom": { "hint": "Bathroom door on the right after the corridor." }
-  },
   "destinations": [
     {
       "destinationId": "counter",
       "label": "coffee counter",
-      "aliases": ["coffee", "counter", "bar"],
-      "steps": ["start", "corridor", "counter"]
+      "aliases": ["coffee", "counter", "bar"]
     },
     {
       "destinationId": "bathroom",
       "label": "bathroom",
-      "aliases": ["bathroom", "toilet", "restroom", "wc"],
-      "steps": ["start", "corridor", "bathroom"]
+      "aliases": ["bathroom", "toilet", "restroom", "wc"]
     }
   ]
 }
