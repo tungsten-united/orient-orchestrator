@@ -323,8 +323,9 @@ impl Events {
     }
 }
 
+/// A clear answer: the frames show `node`, far ahead of any other (the belief commits to it in one result).
 fn confirmed(node: &str) -> Value {
-    json!({"status": "confirmed", "reason": "clear", "best": node, "margin": 0.1, "candidates": [{"node": node, "score": 0.7}]})
+    json!({"status": "confirmed", "reason": "clear", "best": node, "margin": 1.0, "candidates": [{"node": node, "score": 0.7}]})
 }
 
 /// A route: (source, target, first step, instruction) per hop.
@@ -339,7 +340,7 @@ fn path(hops: &[(&str, &str, &str, Option<&str>)]) -> Value {
     json!({"found": true, "hops": hops})
 }
 
-/// Posts frames from `seq` on until an event other than an unchanged heartbeat arrives (the loop needs a few votes).
+/// Posts frames from `seq` on until an event other than an unchanged heartbeat arrives (the belief may need a few results).
 /// Returns it, the next sequence and how many frames it took.
 async fn frames_until_news(
     h: &Harness,
@@ -585,7 +586,7 @@ async fn sessions_frames_worker_and_stop() {
         assert_eq!(n.heading.as_deref(), Some("90.5"));
     }
 
-    // The hop's target leads in 3 of the last 4: reached, and the next hop is spoken. No new route.
+    // The hop's target, clearly: reached, and the next hop is spoken. No new route.
     let route = h.nav.lock().unwrap().route.clone(); // the guard must drop before set_nav locks again
     set_nav("corridor", route, 0);
     let (ev, seq, took) = frames_until_news(&h, &mut rx, &url("frames"), token, 2, 5).await;
@@ -598,7 +599,7 @@ async fn sessions_frames_worker_and_stop() {
         (Some("Turn left."), Some("corridor"), Some("n2"))
     );
     if local {
-        assert_eq!(took, 3); // NAV_VOTE_K
+        assert_eq!(took, 1); // a clear answer: the belief commits at once
     }
     assert_eq!(route_calls(), 1);
     assert_eq!(h.nav.lock().unwrap().expected.as_deref(), Some("corridor"));
@@ -753,11 +754,7 @@ async fn sessions_frames_worker_and_stop() {
         .text()
         .await
         .unwrap();
-    assert!(
-        t.contains("\"framesSent\":1")
-            && t.contains("of the last 4) → reached")
-            && !t.contains(token)
-    );
+    assert!(t.contains("\"framesSent\":1") && t.contains("likely → reached") && !t.contains(token));
 }
 
 /// The server alone, with a fake nav-api that only serves the maps (clients need their map's places).
@@ -1325,21 +1322,17 @@ async fn replay_walk_back(h: &Harness, client: &str) -> Vec<String> {
 /// Live (Glories Basement, 2026-10-10, session 00f49c7b): placed at Playground, Body Shop junction and Rituals shop on
 /// the way back, the orchestrator asked for a route 20 times (none over `observed`: the map was walked the other way)
 /// and said "Please hold still, I need a clearer view." throughout. Now "hold still" is only for before the first
-/// placement: it asks once from each place and says why it can't guide.
+/// placement: it asks once from each place and says why it can't guide. On these answers (top two candidates only,
+/// the walk back barely telling nodes apart) the belief places the user once, at Rituals shop, near the end.
 #[tokio::test]
 async fn should_ask_once_per_place_and_say_there_is_no_way_on_the_live_walk_back() {
     let h = harness_vars(false, &[("NAV_TRUST", "observed")]).await;
     let spoken = replay_walk_back(&h, "00f49c7b").await;
-    assert_eq!(h.nav.lock().unwrap().route_starts, ["n9", "n8", "n5"]);
+    assert_eq!(h.nav.lock().unwrap().route_starts, ["n5"]);
     let no_way = "I can't find a way to the Entrance escalator from here.";
     assert_eq!(
         spoken,
-        [
-            "Please hold still, I need a clearer view.",
-            no_way,
-            no_way,
-            no_way
-        ]
+        ["Please hold still, I need a clearer view.", no_way]
     );
 }
 
@@ -1406,7 +1399,7 @@ async fn should_move_on_past_a_node_the_camera_missed() {
 
     // The corridor is never recognised; the drinks area leads, not confirmed, and could have been walked to.
     h.nav.lock().unwrap().found = json!({"status": "uncertain", "reason": "best score 0.41 < 0.45", "best": "n2",
-        "margin": 0.08, "candidates": [{"node": "n2", "score": 0.41, "plausible": true}]});
+        "margin": 0.2, "candidates": [{"node": "n2", "score": 0.41, "plausible": true}]});
     let (ev, _, sent) = frames_until_news(&h, &mut rx, &url("frames"), token, 2, 1).await;
     assert_eq!(
         (ev["action"].as_str(), ev["text"].as_str()),
@@ -1415,6 +1408,6 @@ async fn should_move_on_past_a_node_the_camera_missed() {
             Some("You have arrived at the drinks area.")
         )
     );
-    assert_eq!(sent, 3); // three of the last four
+    assert!(sent > 1, "{sent}"); // not on one result that isn't clear
     assert_eq!(h.nav.lock().unwrap().route_calls, 1);
 }

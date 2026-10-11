@@ -85,9 +85,10 @@ async fn localize(State(ctl): State<Shared>, mut mp: Multipart) -> Result<Json<V
     let (status, best, margin) = match preset.as_str() {
         "fail" => return Err(StatusCode::INTERNAL_SERVER_ERROR),
         "unsure" => ("uncertain", here, 0.01),
-        "advance" => ("confirmed", expected.clone().unwrap_or(here), 0.1),
-        "arrived" if !goal.is_empty() => ("confirmed", goal, 0.1),
-        _ => ("confirmed", here, 0.1),
+        // clear answers: far ahead of any other node, so the orchestrator's belief commits in one result
+        "advance" => ("confirmed", expected.clone().unwrap_or(here), 1.0),
+        "arrived" if !goal.is_empty() => ("confirmed", goal, 1.0),
+        _ => ("confirmed", here, 1.0),
     };
     Ok(Json(json!({
         "status": status, "reason": format!("fake {preset}, {frames} frames"), "best": best, "margin": margin,
