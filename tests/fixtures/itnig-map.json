@@ -1,0 +1,145 @@
+{
+ "about": "Itnig as nav-api published it on 2026-10-11 (build 20261010T131002Z, cleaned): the nodes, links and live step length the belief reads (GET /maps/itnig, other fields left out). The live sessions of tests/fixtures/itnig-following-restarts.json ran on this build and earlier ones of the same walks; node ids carried over (nav-engine continuity.py).",
+ "map_id": "itnig",
+ "nodes": [
+  {
+   "id": "n1",
+   "name": "Main entrance"
+  },
+  {
+   "id": "n2",
+   "name": "Drinks area"
+  },
+  {
+   "id": "n3",
+   "name": "Hackathon tables"
+  },
+  {
+   "id": "n5",
+   "name": "Right-side tables"
+  },
+  {
+   "id": "n6",
+   "name": "Corridor end"
+  },
+  {
+   "id": "n7",
+   "name": "Kitchen"
+  },
+  {
+   "id": "n8",
+   "name": "Stage"
+  },
+  {
+   "id": "n10",
+   "name": "Centre tables"
+  },
+  {
+   "id": "n11",
+   "name": "Entrance porch"
+  },
+  {
+   "id": "n12",
+   "name": "Bathroom"
+  },
+  {
+   "id": "n13",
+   "name": "Judges' table"
+  }
+ ],
+ "links": [
+  {
+   "source": "n1",
+   "target": "n2",
+   "distance_m": 1.4
+  },
+  {
+   "source": "n2",
+   "target": "n3",
+   "distance_m": 3.5
+  },
+  {
+   "source": "n3",
+   "target": "n2",
+   "distance_m": 0.5
+  },
+  {
+   "source": "n2",
+   "target": "n5",
+   "distance_m": 2.5
+  },
+  {
+   "source": "n5",
+   "target": "n6",
+   "distance_m": 4.3
+  },
+  {
+   "source": "n6",
+   "target": "n7",
+   "distance_m": 3.5
+  },
+  {
+   "source": "n7",
+   "target": "n8",
+   "distance_m": 3.2
+  },
+  {
+   "source": "n8",
+   "target": "n10",
+   "distance_m": 2.3
+  },
+  {
+   "source": "n7",
+   "target": "n10",
+   "distance_m": 2.9
+  },
+  {
+   "source": "n10",
+   "target": "n6",
+   "distance_m": 3.0
+  },
+  {
+   "source": "n5",
+   "target": "n2",
+   "distance_m": 3.0
+  },
+  {
+   "source": "n2",
+   "target": "n1",
+   "distance_m": 6.6
+  },
+  {
+   "source": "n1",
+   "target": "n11",
+   "distance_m": 3.4
+  },
+  {
+   "source": "n6",
+   "target": "n12",
+   "distance_m": 5.5
+  },
+  {
+   "source": "n12",
+   "target": "n7",
+   "distance_m": 2.2
+  },
+  {
+   "source": "n7",
+   "target": "n13",
+   "distance_m": 0.8
+  },
+  {
+   "source": "n13",
+   "target": "n10",
+   "distance_m": 2.7
+  },
+  {
+   "source": "n10",
+   "target": "n6",
+   "distance_m": 5.4
+  }
+ ],
+ "frame": {
+  "live_step_length_m": 0.308
+ }
+}

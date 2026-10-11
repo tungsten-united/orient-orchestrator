@@ -3,7 +3,8 @@
 //!
 //! Every model output is validated here. Nothing in this module changes session state.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -27,6 +28,7 @@ const MAX_LOCALIZE_FRAMES: usize = 4;
 pub struct Place {
     pub map_id: String,
     pub destinations: Vec<Destination>,
+    pub graph: Arc<Graph>,
 }
 
 /// A spot the user can ask for: a node of the map, by its name.
@@ -52,6 +54,7 @@ impl Place {
         Some(Place {
             map_id: map["map_id"].as_str()?.to_string(),
             destinations,
+            graph: Arc::new(Graph::from_map(map)),
         })
     }
 }
@@ -118,37 +121,23 @@ impl Output {
     }
 }
 
-/// The navigation loop's settings (contracts.md section 2, "Navigation loop"). The defaults come from replaying the
-/// Itnig walks through the same loop (nav-engine's `nav map orchestrator-replay`).
+/// The navigation loop's settings (contracts.md section 2, "Navigation loop"): the belief's. The defaults come from
+/// nav-engine's `nav map tune itnig` (2026-10-11, its `BeliefParams`): on episodes stitched from the Itnig walks, each
+/// matched against the other walks' references, 293 of 966 nodes reached with no wrong move, where the votes this
+/// replaced reached 289 with 430 wrong. Except the temperature: live frames separate nodes less than replayed ones
+/// (Itnig's median lead 0.05 live, 0.068 replayed), so the tuned 0.25 is scaled by that ratio to 0.18. On replays
+/// 0.18 is past the edge (203 wrong of 966): raise NAV_BELIEF_TEMPERATURE if staging shows wrong moves, lower it if
+/// users wait too long to be located.
 #[derive(Clone, Copy, Debug)]
 pub struct NavLoop {
     pub burst: usize, // NAV_BURST: frames not sent to localize yet that start an evaluation
-    pub k: usize,     // NAV_VOTE_K: votes needed ...
-    pub n: usize,     // NAV_VOTE_N: ... among the last n localizations
-    pub margin: f64, // NAV_MARGIN: a result votes only when its best node leads the second by this much
-    pub lost_ms: i64, // NAV_LOST_MS: following, no result pointing at the hop for this long starts a new navigation
-    pub locate_lost_margin: f64, // NAV_LOCATE_LOST_MARGIN: locating, a `lost` result votes when its best leads by this
-}
-
-/// One localization's vote in the navigation loop.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Vote {
-    /// The user seems to be at this node: locating, any node; following, the hop's target or a node further on.
-    At(String),
-    /// Following: a node off the route is confirmed.
-    Elsewhere,
-    Abstain,
-}
-
-impl Vote {
-    /// How the trace shows it.
-    pub fn name(&self) -> String {
-        match self {
-            Vote::At(node) => node.clone(),
-            Vote::Elsewhere => "elsewhere".into(),
-            Vote::Abstain => "none".into(),
-        }
-    }
+    pub temperature: f64, // NAV_BELIEF_TEMPERATURE: score difference that makes a node e times less likely than the leader
+    pub gate: f64,        // NAV_BELIEF_GATE: likelihood of a node nav-api marks farther than walked
+    pub jump: f64,        // NAV_BELIEF_JUMP: belief spread over every node each localization
+    pub walk_scale: f64, // NAV_BELIEF_WALK_SCALE: metres walked = phone steps x the map's live step length x this
+    pub walk_m_per_call: f64, // NAV_BELIEF_WALK_M_PER_CALL: metres walked per localization without steps
+    pub reach: f64,           // NAV_BELIEF_REACH: locate at, or reach a node ahead, this likely
+    pub leave: f64,           // NAV_BELIEF_LEAVE: drop the route for a node off it this likely
 }
 
 /// What a `localize` call says besides the frames: the hop being followed, or the last node when locating again.
@@ -168,62 +157,168 @@ pub struct Caller {
     pub request: String,
 }
 
-/// The best node of a localization, when it leads the second by `margin` (`lost_margin` for a `lost` result,
-/// None: a `lost` result never leads) and the user can be there: nav-api doesn't mark it as farther than they walked
-/// (`plausible: false`).
-fn leader(found: &Value, margin: f64, lost_margin: Option<f64>) -> Option<&str> {
-    let best = found["best"].as_str().filter(|n| !n.is_empty())?;
-    let top = &found["candidates"][0];
-    let too_far = top["node"] == best && top["plausible"] == false;
-    let lead = found["margin"].as_f64().unwrap_or(0.0);
-    let needed = if found["status"] == "lost" {
-        lost_margin?
-    } else {
-        margin
-    };
-    (lead >= needed && !too_far).then_some(best)
+const UNKNOWN_LENGTH_M: f64 = 10.0; // an edge without a distance, as nav-engine's route.py
+
+/// The map as the belief walks it (`GET /maps/{map_id}`): its nodes, metres between linked nodes either way (over
+/// `links`, the connections before cleaning, as nav-api's walked-distance gate; else `edges`), and metres per
+/// phone step (`frame.live_step_length_m`).
+#[derive(Clone, Debug, Default)]
+pub struct Graph {
+    pub nodes: Vec<String>,
+    links: HashMap<String, Vec<(String, f64)>>,
+    pub step_length_m: f64,
 }
 
-/// Locating: the leading node gets a vote. A `lost` result (every score low) votes too when its best node leads by
-/// `lost_margin`: live frames often score under nav-api's lost score while the same node keeps leading (Itnig,
-/// 2026-10-10: the kitchen led 25 results in a row, all `lost`, and the user waited 17 s). The K-of-N agreement still
-/// decides, and following never counts a `lost` result.
-pub fn locate_vote(found: &Value, margin: f64, lost_margin: f64) -> Vote {
-    leader(found, margin, Some(lost_margin)).map_or(Vote::Abstain, |n| Vote::At(n.into()))
+impl Graph {
+    pub fn from_map(map: &Value) -> Graph {
+        let nodes = map["nodes"].as_array().into_iter().flatten();
+        let nodes = nodes
+            .filter_map(|n| Some(n["id"].as_str()?.to_string()))
+            .collect();
+        let links = map["links"].as_array().filter(|l| !l.is_empty());
+        let mut out: HashMap<String, Vec<(String, f64)>> = HashMap::new();
+        for e in links.or(map["edges"].as_array()).into_iter().flatten() {
+            let (Some(a), Some(b)) = (e["source"].as_str(), e["target"].as_str()) else {
+                continue;
+            };
+            let length = e["distance_m"]
+                .as_f64()
+                .unwrap_or(UNKNOWN_LENGTH_M)
+                .max(0.5);
+            for (x, y) in [(a, b), (b, a)] {
+                let next = out.entry(x.to_string()).or_default();
+                match next.iter_mut().find(|(n, _)| n == y) {
+                    Some(l) => l.1 = l.1.min(length),
+                    None if x != y => next.push((y.to_string(), length)),
+                    None => {}
+                }
+            }
+        }
+        let frame = &map["frame"];
+        let step = frame["live_step_length_m"]
+            .as_f64()
+            .or(frame["step_length_m"].as_f64());
+        Graph {
+            nodes,
+            links: out,
+            step_length_m: step.unwrap_or(0.7),
+        }
+    }
 }
 
-/// Following from `source`, with `ahead` the route's nodes still to reach (the hop's target first): where does the
-/// result put the user?
+/// Where the user is, as a probability per node (nav-engine's `navigation/belief.py`, the same rules):
 ///
-/// - At a node ahead on the route, when it leads: the hop's target, or one further on, because the user walked past a
-///   node the camera missed. Hop by hop only, a missed node meant starting over: live, 8 of the 15 restarts where
-///   another node won were a node further on, and locating again put the user there in 6, after "Please hold still"
-///   (Itnig, 2026-10-10; tests/fixtures/itnig-following-restarts.json). Since `elsewhere` needs confirmed results, the
-///   same walk waits `NAV_LOST_MS` first. nav-api's walked-distance gate (`plausible`, `leader`) is what keeps a node
-///   seen from afar from counting before the user walked that far. Without it (no motion, session a08f7beb), counting
-///   the nodes ahead declared arrival at the stage early; the phone now always sends its motion.
-/// - Elsewhere: a node off the route, confirmed. nav-api confirms a node only next to the hop's source, or within
-///   what the user walked; an `uncertain` one is mostly noise (Itnig, 2026-10-10: 53 of 70 elsewhere votes were
-///   uncertain, and they caused 15 of the 20 restarts). A long stretch of other nodes leading starts over too
-///   (`NAV_LOST_MS`, `advance` in client.rs).
-pub fn follow_vote(found: &Value, source: &str, ahead: &[String], margin: f64) -> Vote {
-    match leader(found, margin, None) {
-        Some(n) if ahead.iter().any(|a| a == n) => Vote::At(n.into()),
-        Some(n) if n != source && found["status"] == "confirmed" => Vote::Elsewhere,
-        _ => Vote::Abstain,
-    }
-}
+/// - walking w metres, the user leaves node a for a linked node b at a rate w / metres(a, b); a little of the belief
+///   (`jump`) spreads over every node each time (a move the camera and the steps missed, a wrong start);
+/// - a `localize` result with node scores s multiplies node n by exp((s_n - s_best) / temperature), and a node nav-api
+///   marks not plausible (farther than walked) by `gate`. A node it doesn't list scores as the lowest listed, at
+///   most the leader minus the margin. Live scores are low; their differences are what tells.
+///
+/// Empty: nothing known yet, uniform over the map's nodes at the first update. A node nav-api names that the map
+/// doesn't have joins with the share `jump` gives every node.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Belief(BTreeMap<String, f64>);
 
-/// Adds `vote` to the last `n` votes and counts the ones equal to it (none for an abstention).
-pub fn tally(votes: &mut VecDeque<Vote>, vote: Vote, n: usize) -> usize {
-    votes.push_back(vote.clone());
-    while votes.len() > n.max(1) {
-        votes.pop_front();
+impl Belief {
+    /// Sure the user is at `node`.
+    pub fn at(node: &str) -> Belief {
+        Belief(BTreeMap::from([(node.to_string(), 1.0)]))
     }
-    if vote == Vote::Abstain {
-        0
-    } else {
-        votes.iter().filter(|v| **v == vote).count()
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn prob(&self, node: &str) -> f64 {
+        self.0.get(node).copied().unwrap_or(0.0)
+    }
+
+    /// The most likely node and its probability.
+    pub fn best(&self) -> Option<(&str, f64)> {
+        self.0
+            .iter()
+            .fold(None, |best: Option<(&str, f64)>, (n, &p)| match best {
+                Some((_, q)) if q >= p => best,
+                _ => Some((n, p)),
+            })
+    }
+
+    fn add(&mut self, node: &str, cfg: &NavLoop) {
+        if !self.0.contains_key(node) {
+            let share = if self.0.is_empty() {
+                1.0
+            } else {
+                cfg.jump / self.0.len() as f64
+            };
+            self.0.insert(node.to_string(), share);
+        }
+    }
+
+    fn normalize(&mut self) {
+        let total: f64 = self.0.values().sum();
+        let n = self.0.len() as f64;
+        for p in self.0.values_mut() {
+            *p = if total > 0.0 { *p / total } else { 1.0 / n };
+        }
+    }
+
+    /// Walking `walked_m` since the last result.
+    pub fn predict(&mut self, graph: &Graph, walked_m: f64, cfg: &NavLoop) {
+        if self.0.is_empty() {
+            self.0 = graph.nodes.iter().map(|n| (n.clone(), 1.0)).collect(); // uniform, once normalized
+        }
+        let mut next: BTreeMap<String, f64> = self.0.keys().map(|n| (n.clone(), 0.0)).collect();
+        for (a, &p) in &self.0 {
+            let rates: Vec<(&String, f64)> = graph
+                .links
+                .get(a)
+                .into_iter()
+                .flatten()
+                .map(|(b, length)| (b, walked_m.max(0.0) / length))
+                .collect();
+            let total: f64 = rates.iter().map(|(_, r)| r).sum();
+            let leave = 1.0 - (-total).exp();
+            *next.entry(a.clone()).or_default() += p * (1.0 - leave);
+            for (b, r) in rates.into_iter().filter(|_| total > 0.0) {
+                *next.entry(b.clone()).or_default() += p * leave * r / total;
+            }
+        }
+        let share = cfg.jump / next.len().max(1) as f64;
+        for p in next.values_mut() {
+            *p = (1.0 - cfg.jump) * *p + share;
+        }
+        self.0 = next;
+        self.normalize();
+    }
+
+    /// A `localize` result.
+    pub fn update(&mut self, found: &Value, cfg: &NavLoop) {
+        let listed: Vec<(&str, f64, bool)> = found["candidates"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| {
+                Some((
+                    c["node"].as_str()?,
+                    c["score"].as_f64()?,
+                    c["plausible"] == false,
+                ))
+            })
+            .collect();
+        let Some(best) = listed.iter().map(|c| c.1).reduce(f64::max) else {
+            return;
+        };
+        let margin = found["margin"].as_f64().unwrap_or(0.0);
+        let floor = listed.iter().map(|c| c.1).fold(best - margin, f64::min);
+        listed.iter().for_each(|(n, _, _)| self.add(n, cfg));
+        for (n, p) in self.0.iter_mut() {
+            let (score, too_far) = listed
+                .iter()
+                .find(|c| c.0 == n)
+                .map_or((floor, false), |c| (c.1, c.2));
+            *p *= ((score - best) / cfg.temperature).exp() * if too_far { cfg.gate } else { 1.0 };
+        }
+        self.normalize();
     }
 }
 
@@ -399,13 +494,27 @@ impl Pipeline {
             nav_trust: env("NAV_TRUST", "any"),
             nav_loop: NavLoop {
                 burst: env("NAV_BURST", "1").parse().expect("NAV_BURST"),
-                k: env("NAV_VOTE_K", "3").parse().expect("NAV_VOTE_K"),
-                n: env("NAV_VOTE_N", "4").parse().expect("NAV_VOTE_N"),
-                margin: env("NAV_MARGIN", "0.04").parse().expect("NAV_MARGIN"),
-                lost_ms: env("NAV_LOST_MS", "6000").parse().expect("NAV_LOST_MS"),
-                locate_lost_margin: env("NAV_LOCATE_LOST_MARGIN", "0.06")
+                temperature: env("NAV_BELIEF_TEMPERATURE", "0.18")
                     .parse()
-                    .expect("NAV_LOCATE_LOST_MARGIN"),
+                    .expect("NAV_BELIEF_TEMPERATURE"),
+                gate: env("NAV_BELIEF_GATE", "0.8")
+                    .parse()
+                    .expect("NAV_BELIEF_GATE"),
+                jump: env("NAV_BELIEF_JUMP", "0.1")
+                    .parse()
+                    .expect("NAV_BELIEF_JUMP"),
+                walk_scale: env("NAV_BELIEF_WALK_SCALE", "3.7")
+                    .parse()
+                    .expect("NAV_BELIEF_WALK_SCALE"),
+                walk_m_per_call: env("NAV_BELIEF_WALK_M_PER_CALL", "1.5")
+                    .parse()
+                    .expect("NAV_BELIEF_WALK_M_PER_CALL"),
+                reach: env("NAV_BELIEF_REACH", "0.7")
+                    .parse()
+                    .expect("NAV_BELIEF_REACH"),
+                leave: env("NAV_BELIEF_LEAVE", "0.7")
+                    .parse()
+                    .expect("NAV_BELIEF_LEAVE"),
             },
             engine: env("NAV_ENGINE", "nav-engine"),
             eleven: ElevenLabs {
@@ -612,7 +721,8 @@ impl Pipeline {
     ) -> Result<Value, BoxError> {
         let skip = frames.len().saturating_sub(MAX_LOCALIZE_FRAMES);
         let frames: Vec<_> = frames.into_iter().skip(skip).collect();
-        let mut form = Form::new();
+        // every node's score (nav-api's maximum): the belief weighs them all
+        let mut form = Form::new().text("top_k", "20");
         if let Some(node) = &ask.previous {
             form = form.text("previous", node.clone());
         }
@@ -670,18 +780,6 @@ impl Pipeline {
             return Err("route: not a JSON object".into());
         }
         Ok(out)
-    }
-
-    /// The node a localization puts the user at, only when nav-api confirmed it.
-    pub fn located(&self, found: &Value) -> Option<String> {
-        (found["status"] == "confirmed")
-            .then(|| {
-                found["best"]
-                    .as_str()
-                    .filter(|n| !n.is_empty())
-                    .map(String::from)
-            })
-            .flatten()
     }
 
     /// Turn a route from `node` into an Output: its first hop (`hop_output`), or `wait` when nav-api found none.
@@ -798,104 +896,121 @@ mod tests {
         assert_eq!(p.nav_url, "http://nav");
     }
 
-    #[test]
-    fn should_locate_only_on_a_confirmed_node() {
-        let p = Pipeline::from_vars(&|_| None);
-        let at =
-            |status: &str| json!({"status": status, "best": "n4", "margin": 0.1, "candidates": []});
-        assert_eq!(p.located(&at("confirmed")), Some("n4".into()));
-        assert_eq!(p.located(&at("uncertain")), None);
-        assert_eq!(p.located(&at("lost")), None);
-        assert_eq!(
-            p.located(&json!({"status": "confirmed", "best": null})),
-            None
-        );
+    const CFG: NavLoop = NavLoop {
+        burst: 1,
+        temperature: 0.03,
+        gate: 0.2,
+        jump: 0.01,
+        walk_scale: 1.0,
+        walk_m_per_call: 0.0,
+        reach: 0.7,
+        leave: 0.8,
+    };
+
+    /// n1 - n2 (1.4 m), n2 - n4 (2 m), n2 - n3 (3.5 m), n2 - n5 (3 m); n7 linked to nothing.
+    fn graph() -> Graph {
+        let nodes = ["n1", "n2", "n3", "n4", "n5", "n7"].map(|n| json!({"id": n, "name": n}));
+        Graph::from_map(&json!({
+            "nodes": nodes,
+            "links": [{"source": "n1", "target": "n2", "distance_m": 1.4}, {"source": "n2", "target": "n4", "distance_m": 2.0},
+                      {"source": "n3", "target": "n2", "distance_m": 3.5}, {"source": "n2", "target": "n5", "distance_m": 3.0}],
+            "edges": [{"source": "n1", "target": "n7", "distance_m": 1.0}],
+            "frame": {"live_step_length_m": 0.31},
+        }))
+    }
+
+    /// Every node listed: the named ones with their scores, the others at 0.2.
+    fn scores(named: &[(&str, f64)], too_far: &[&str]) -> Value {
+        let mut all: Vec<(&str, f64)> = ["n1", "n2", "n3", "n4", "n5", "n7"]
+            .iter()
+            .map(|n| (*n, named.iter().find(|x| x.0 == *n).map_or(0.2, |x| x.1)))
+            .collect();
+        all.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let candidates: Vec<Value> = all
+            .iter()
+            .map(|(n, s)| {
+                json!({"node": n, "score": s,
+            "plausible": if too_far.contains(n) { json!(false) } else { Value::Null }})
+            })
+            .collect();
+        json!({"status": "uncertain", "best": all[0].0, "margin": all[0].1 - all[1].1, "candidates": candidates})
     }
 
     #[test]
-    fn should_vote_on_the_leading_node_only_when_it_clearly_leads() {
-        let found = |status: &str, best: &str, margin: f64| {
-            json!({"status": status, "best": best, "margin": margin,
-                   "candidates": [{"node": best, "score": 0.4, "plausible": null}]})
-        };
-        // low scores are fine: what counts is which node leads
+    fn should_read_the_graph_from_the_links_before_the_edges_and_the_live_step_length() {
+        let g = graph();
+        assert_eq!(g.nodes.len(), 6);
+        assert_eq!(g.step_length_m, 0.31);
+        assert!(g.links["n2"].contains(&("n3".into(), 3.5)) && !g.links.contains_key("n7"));
+        let edges_only =
+            Graph::from_map(&json!({"nodes": [], "edges": [{"source": "a", "target": "b"}]}));
         assert_eq!(
-            locate_vote(&found("uncertain", "n4", 0.05), 0.04, 0.06),
-            Vote::At("n4".into())
+            edges_only.links["b"],
+            vec![("a".to_string(), UNKNOWN_LENGTH_M)]
         );
-        assert_eq!(
-            locate_vote(&found("uncertain", "n4", 0.02), 0.04, 0.06),
-            Vote::Abstain
-        );
-        // a `lost` result votes while locating only with a clearer lead; following, never
-        assert_eq!(
-            locate_vote(&found("lost", "n4", 0.05), 0.04, 0.06),
-            Vote::Abstain
-        );
-        assert_eq!(
-            locate_vote(&found("lost", "n4", 0.07), 0.04, 0.06),
-            Vote::At("n4".into())
-        );
-        let ahead = |nodes: &[&str]| nodes.iter().map(|n| n.to_string()).collect::<Vec<_>>();
-        let route = ahead(&["n5", "n6", "n8"]); // following n4 -> n5, then n6, then the goal n8
-        assert_eq!(
-            follow_vote(&found("lost", "n5", 0.2), "n4", &route, 0.04),
-            Vote::Abstain
-        );
-        assert_eq!(
-            locate_vote(&json!({"status": "lost", "candidates": []}), 0.04, 0.06),
-            Vote::Abstain
-        );
-        let mut too_far = found("uncertain", "n5", 0.1);
-        too_far["candidates"][0]["plausible"] = json!(false);
-        assert_eq!(locate_vote(&too_far, 0.04, 0.06), Vote::Abstain);
-        assert_eq!(follow_vote(&too_far, "n4", &route, 0.04), Vote::Abstain);
-        // the hop's target from any lead; still at the source, no vote
-        assert_eq!(
-            follow_vote(&found("uncertain", "n5", 0.05), "n4", &route, 0.04),
-            Vote::At("n5".into())
-        );
-        assert_eq!(
-            follow_vote(&found("confirmed", "n4", 0.1), "n4", &route, 0.04),
-            Vote::Abstain
-        );
-        // further on the route, like the target: the user walked past a node the camera missed
-        assert_eq!(
-            follow_vote(&found("confirmed", "n6", 0.1), "n4", &route, 0.04),
-            Vote::At("n6".into())
-        );
-        assert_eq!(
-            follow_vote(&found("uncertain", "n8", 0.1), "n4", &route, 0.04),
-            Vote::At("n8".into())
-        );
-        // ... unless nav-api says the user hasn't walked that far: the goal seen from afar
-        let mut seen_from_afar = found("uncertain", "n8", 0.1);
-        seen_from_afar["candidates"][0]["plausible"] = json!(false);
-        assert_eq!(
-            follow_vote(&seen_from_afar, "n4", &route, 0.04),
-            Vote::Abstain
-        );
-        // off the route: confirmed, elsewhere; merely leading, nothing
-        assert_eq!(
-            follow_vote(&found("confirmed", "n9", 0.1), "n4", &route, 0.04),
-            Vote::Elsewhere
-        );
-        assert_eq!(
-            follow_vote(&found("uncertain", "n9", 0.1), "n4", &route, 0.04),
-            Vote::Abstain
-        );
+        assert_eq!(edges_only.step_length_m, 0.7);
     }
 
     #[test]
-    fn should_count_votes_among_the_last_n() {
-        let mut votes = VecDeque::new();
-        let n2 = || Vote::At("n2".into());
-        assert_eq!(tally(&mut votes, n2(), 4), 1);
-        assert_eq!(tally(&mut votes, Vote::Abstain, 4), 0);
-        assert_eq!(tally(&mut votes, n2(), 4), 2);
-        assert_eq!(tally(&mut votes, Vote::Elsewhere, 4), 1);
-        assert_eq!(tally(&mut votes, n2(), 4), 2); // the first n2 fell out of the window
-        assert_eq!(votes.len(), 4);
+    fn should_add_up_a_small_lead_that_keeps_up_where_one_result_is_not_enough() {
+        let (g, mut b) = (graph(), Belief::default());
+        b.predict(&g, 0.0, &CFG);
+        b.update(&scores(&[("n2", 0.33), ("n3", 0.31)], &[]), &CFG);
+        let (best, p) = b.best().unwrap();
+        assert!(best == "n2" && p < 0.7, "{p}");
+        for _ in 0..4 {
+            b.predict(&g, 0.0, &CFG);
+            b.update(&scores(&[("n2", 0.33), ("n3", 0.31)], &[]), &CFG);
+        }
+        let (best, p) = b.best().unwrap();
+        assert!(best == "n2" && p > 0.7, "{p}");
+    }
+
+    #[test]
+    fn should_move_belief_to_linked_nodes_the_nearer_sooner_when_walking_and_keep_it_standing() {
+        let (g, cfg) = (graph(), NavLoop { jump: 0.0, ..CFG });
+        let mut b = Belief(BTreeMap::from([("n2".to_string(), 1.0)]));
+        b.predict(&g, 0.0, &cfg);
+        assert_eq!(b.prob("n2"), 1.0);
+        b.predict(&g, 1.0, &cfg);
+        assert!(
+            b.prob("n1") > b.prob("n4")
+                && b.prob("n4") > b.prob("n5")
+                && b.prob("n5") > b.prob("n3")
+        );
+        assert_eq!(b.prob("n7"), 0.0);
+        assert!((b.0.values().sum::<f64>() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn should_weigh_less_a_node_nav_api_marks_farther_than_walked() {
+        let g = graph();
+        let (mut a, mut b) = (Belief::default(), Belief::default());
+        a.predict(&g, 0.0, &CFG);
+        b.predict(&g, 0.0, &CFG);
+        a.update(&scores(&[("n5", 0.4)], &[]), &CFG);
+        b.update(&scores(&[("n5", 0.4)], &["n5"]), &CFG);
+        assert!(b.prob("n5") < a.prob("n5"));
+    }
+
+    #[test]
+    fn should_learn_from_one_candidate_through_the_margin_and_take_in_nodes_the_map_lacks() {
+        let g = graph();
+        let mut b = Belief::default();
+        b.predict(&g, 0.0, &CFG);
+        b.update(
+            &json!({"best": "n2", "margin": 0.1, "candidates": [{"node": "n2", "score": 0.4}]}),
+            &CFG,
+        );
+        assert!(b.prob("n2") > 3.0 * b.prob("n3"));
+        b.update(
+            &json!({"best": "x9", "margin": 0.1, "candidates": [{"node": "x9", "score": 0.5}]}),
+            &CFG,
+        );
+        assert!(b.prob("x9") > 0.0 && (b.0.values().sum::<f64>() - 1.0).abs() < 1e-9);
+        let mut nothing = b.clone();
+        nothing.update(&json!({"status": "lost", "candidates": []}), &CFG);
+        assert_eq!(nothing, b);
     }
 
     #[test]

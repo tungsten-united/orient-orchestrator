@@ -9,7 +9,7 @@ It implements [`docs/contracts.md`](https://github.com/tungsten-united/project-d
 - **Client:** one phone from Start to Stop. It holds the token and the event stream (`/v1/clients/{id}/…`).
 - **Session:** one spoken action, such as going to the drinks area. The phone sends audio, the orchestrator runs speech-to-text, then Jev picks the action. A different action from the current session starts a new session, with a new `sessionId`, a new generation, an empty frame buffer and no previous output. The same action keeps the current session.
 - **Frame buffer:** each session keeps its last `NAV_FRAMES` (4) frames. Each `localize` call gets the ones it has not sent before, oldest first, each with the phone's `motion`.
-- **Navigation loop:** locate the user (votes over `localize` results), one `route`, then follow it: each `localize` (previous = hop source, expected = hop target) is a vote, and the hop's target or a node further on (one the camera missed) can be reached; the route goes on from there. Lost, it locates again (contracts.md section 2). Live test: `tests/live_nav.rs` (`--ignored`, needs `NAV_URL`, `NAV_API_TOKEN`, `NAV_LIVE_IMAGE`).
+- **Navigation loop:** a probability per map node (the belief), moved by the steps walked and reweighed by each `localize` result; locate the user once one node is likely enough, one `route`, then follow it: each `localize` (previous = hop source, expected = hop target) updates the belief, and the hop's target or a node further on (one the camera missed) is reached once likely enough; the route goes on from there. Lost, it locates again (contracts.md section 2). Live test: `tests/live_nav.rs` (`--ignored`, needs `NAV_URL`, `NAV_API_TOKEN`, `NAV_LIVE_IMAGE`).
 - **Worker:** one per client. It evaluates the newest frame, validates the navigation answer against the route, and compares the result with the session's previous output. It sends `guidance` only when the output changed or the user asked for the same destination again; otherwise it sends a quiet `heartbeat`.
 
 ## Run
@@ -139,11 +139,13 @@ To require approval before each release, add required reviewers to the `staging`
 | `MAX_FRAME_EDGE_PX` | `640` | `limits.maxFrameEdgePx`: longest edge of the phone's frames. nav-api squashes them to 322 px, so larger ones only cost upload time |
 | `NAV_FRAMES` | `4` | Frames per `localize` call (nav-api takes at most 4) |
 | `NAV_BURST` | `1` | Frames not sent to `localize` yet that start an evaluation (each frame is sent once) |
-| `NAV_VOTE_K` | `3` | Votes needed among the last `NAV_VOTE_N` localizations to locate the user, reach a node ahead on the route, or call them lost |
-| `NAV_VOTE_N` | `4` | Window of the votes |
-| `NAV_MARGIN` | `0.04` | A localization votes only when its best node leads the second by this much |
-| `NAV_LOCATE_LOST_MARGIN` | `0.06` | While locating, a `lost` result (all scores low) votes for its best node when it leads by this much (`1` turns it off) |
-| `NAV_LOST_MS` | `6000` | Following, no result pointing at the hop for this long (by the frames' `capturedAt`) starts a new navigation: every one `lost`, or led by a node off the hop. A time, so the frame rate doesn't change it |
+| `NAV_BELIEF_TEMPERATURE` | `0.18` | The belief (a probability per map node, `pipeline::Belief`): a node scoring this much below the leader is e times less likely. Higher: more cautious, slower to locate; lower: quicker, more wrong moves. Tuned 0.25 on replays, scaled to live scores |
+| `NAV_BELIEF_GATE` | `0.8` | Likelihood factor for a node nav-api marks farther than the user walked |
+| `NAV_BELIEF_JUMP` | `0.1` | Belief spread over every node each localization (a move the camera and steps missed) |
+| `NAV_BELIEF_WALK_SCALE` | `3.7` | Metres the belief moves per phone step, times the map's live step length |
+| `NAV_BELIEF_WALK_M_PER_CALL` | `1.5` | Metres the belief moves per localization when the phone sends no steps |
+| `NAV_BELIEF_REACH` | `0.7` | Locate the user at, or reach a node ahead on the route, once it is this likely |
+| `NAV_BELIEF_LEAVE` | `0.7` | Drop the route and locate again once a node off it is this likely |
 | `MAX_INPUT_AGE_MS` | `3000` | Reject older input |
 | `TRACE_PATH` | unset | Also append the run trace as JSON lines to this file |
 | `ALLOW_ORIGINS` | `*` | CORS origins, comma separated |
