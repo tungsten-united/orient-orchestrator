@@ -138,6 +138,7 @@ pub struct NavLoop {
     pub walk_m_per_call: f64, // NAV_BELIEF_WALK_M_PER_CALL: metres walked per localization without steps
     pub reach: f64,           // NAV_BELIEF_REACH: locate at, or reach a node ahead, this likely
     pub leave: f64,           // NAV_BELIEF_LEAVE: drop the route for a node off it this likely
+    pub pose: bool, // NAV_POSE: a node nav-api confirms with the camera's pose (its 3D model) takes the whole belief
 }
 
 /// What a `localize` call says besides the frames: the hop being followed, or the last node when locating again.
@@ -212,7 +213,9 @@ impl Graph {
 ///   (`jump`) spreads over every node each time (a move the camera and the steps missed, a wrong start);
 /// - a `localize` result with node scores s multiplies node n by exp((s_n - s_best) / temperature), and a node nav-api
 ///   marks not plausible (farther than walked) by `gate`. A node it doesn't list scores as the lowest listed, at
-///   most the leader minus the margin. Live scores are low; their differences are what tells.
+///   most the leader minus the margin. Live scores are low; their differences are what tells;
+/// - unless the result is confirmed by a pose (nav-engine's 3D model: the camera's position, with enough inliers, in
+///   that node's region, walked far enough): then the user is at that node, all the belief on it (`pose`).
 ///
 /// Empty: nothing known yet, uniform over the map's nodes at the first update. A node nav-api names that the map
 /// doesn't have joins with the share `jump` gives every node.
@@ -293,6 +296,10 @@ impl Belief {
 
     /// A `localize` result.
     pub fn update(&mut self, found: &Value, cfg: &NavLoop) {
+        if let Some(node) = pose_confirmed(found).filter(|_| cfg.pose) {
+            *self = Belief::at(node);
+            return;
+        }
         let listed: Vec<(&str, f64, bool)> = found["candidates"]
             .as_array()
             .into_iter()
@@ -320,6 +327,13 @@ impl Belief {
         }
         self.normalize();
     }
+}
+
+/// The node a `localize` result confirms by the camera's pose (contracts.md section 2, "Pose"): `status`
+/// confirmed and `pose.node` the `best` node.
+pub fn pose_confirmed(found: &Value) -> Option<&str> {
+    let node = found["pose"]["node"].as_str()?;
+    (found["status"] == "confirmed" && found["best"].as_str() == Some(node)).then_some(node)
 }
 
 pub struct Pipeline {
@@ -515,6 +529,7 @@ impl Pipeline {
                 leave: env("NAV_BELIEF_LEAVE", "0.7")
                     .parse()
                     .expect("NAV_BELIEF_LEAVE"),
+                pose: env("NAV_POSE", "1") != "0",
             },
             engine: env("NAV_ENGINE", "nav-engine"),
             eleven: ElevenLabs {
@@ -905,6 +920,7 @@ mod tests {
         walk_m_per_call: 0.0,
         reach: 0.7,
         leave: 0.8,
+        pose: true,
     };
 
     /// n1 - n2 (1.4 m), n2 - n4 (2 m), n2 - n3 (3.5 m), n2 - n5 (3 m); n7 linked to nothing.
@@ -980,6 +996,33 @@ mod tests {
         );
         assert_eq!(b.prob("n7"), 0.0);
         assert!((b.0.values().sum::<f64>() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn should_put_the_whole_belief_on_a_node_confirmed_by_the_pose() {
+        let g = graph();
+        let mut b = Belief::default();
+        b.predict(&g, 0.0, &CFG);
+        b.update(&scores(&[("n2", 0.45), ("n3", 0.31)], &[]), &CFG);
+        let mut posed = scores(&[("n2", 0.45), ("n3", 0.31)], &[]); // the scores still lead with n2 ...
+        posed["status"] = json!("confirmed");
+        posed["best"] = json!("n3"); // ... but the pose puts the camera at n3
+        posed["pose"] =
+            json!({"x_m": 1.0, "y_m": 2.0, "heading_deg": 90.0, "inliers": 180, "node": "n3"});
+        assert_eq!(pose_confirmed(&posed), Some("n3"));
+        b.update(&posed, &CFG);
+        assert_eq!(b.best(), Some(("n3", 1.0)));
+        // walking on spreads it along the links as usual
+        b.predict(&g, 1.0, &CFG);
+        assert!(b.prob("n3") < 1.0 && b.prob("n2") > 0.0);
+        // a pose that doesn't confirm (between nodes, too few inliers, farther than walked) is just scores
+        let mut between = posed.clone();
+        between["status"] = json!("uncertain");
+        assert_eq!(pose_confirmed(&between), None);
+        let mut off = Belief::default();
+        off.predict(&g, 0.0, &CFG);
+        off.update(&posed, &NavLoop { pose: false, ..CFG });
+        assert_eq!(off.best().unwrap().0, "n2");
     }
 
     #[test]
