@@ -146,6 +146,7 @@ To require approval before each release, add required reviewers to the `staging`
 | `NAV_BELIEF_WALK_M_PER_CALL` | `1.5` | Metres the belief moves per localization when the phone sends no steps |
 | `NAV_BELIEF_REACH` | `0.7` | Locate the user at, or reach a node ahead on the route, once it is this likely |
 | `NAV_BELIEF_LEAVE` | `0.7` | Drop the route and locate again once a node off it is this likely |
+| `NAV_POSE` | `1` | A node nav-api confirms with the camera's pose (the map's 3D model, contracts.md section 2) takes the whole belief; `0`: the scores alone |
 | `MAX_INPUT_AGE_MS` | `3000` | Reject older input |
 | `TRACE_PATH` | unset | Also append the run trace as JSON lines to this file |
 | `ALLOW_ORIGINS` | `*` | CORS origins, comma separated |

@@ -1342,6 +1342,26 @@ mod tests {
         assert_eq!((nav.node.as_deref(), nav.node_steps), (Some("n1"), Some(3)));
     }
 
+    /// `found(best, margin)` confirmed by the camera's pose at `node`.
+    fn posed(best: &str, node: &str) -> Value {
+        let mut f = found(best, 0.02);
+        f["status"] = json!("confirmed");
+        f["best"] = json!(node);
+        f["pose"] =
+            json!({"x_m": 0.0, "y_m": 0.0, "heading_deg": 0.0, "inliers": 150, "node": node});
+        f
+    }
+
+    #[test]
+    fn should_locate_and_reach_at_once_on_a_pose() {
+        let mut nav = Nav::default();
+        let (i, mv) = until_move(&mut nav, &posed("n9", "n1"), 3, 0, 5);
+        assert_eq!((i, mv), (0, Move::Located("n1".into()))); // the scores' weak n9 lead doesn't matter
+        nav.path = Some(path());
+        let (i, mv) = until_move(&mut nav, &posed("n2", "n3"), 30, 0, 5); // n2 missed by the camera, walked past
+        assert_eq!((i, mv), (0, Move::Reached("n3".into())));
+    }
+
     #[test]
     fn should_reach_a_node_further_on_and_end_the_path_at_its_last_hop() {
         let mut nav = Nav::default();
